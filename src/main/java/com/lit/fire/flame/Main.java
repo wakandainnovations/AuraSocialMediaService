@@ -45,8 +45,8 @@ public class Main {
 
     public static void main(String[] args) {
         List<ScannableService> services = new ArrayList<>();
-        services.add(new ScannableService(new InstagramService(), "Instagram"));
-        services.add(new ScannableService(new RedditAuthClientWithSearch(), "Reddit"));
+//        services.add(new ScannableService(new InstagramService(), "Instagram"));
+//        services.add(new ScannableService(new RedditAuthClientWithSearch(), "Reddit"));
         services.add(new ScannableService(new XService(), "X"));
         services.add(new ScannableService(new YouTubeMain(), "YouTube"));
 

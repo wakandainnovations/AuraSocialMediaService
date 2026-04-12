@@ -181,16 +181,18 @@ public class RedditAuthClientWithSearch implements SocialMediaScanner {
                     return;
                 }
                 try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
-                    String searchQuery;
+                    String line;
 
-                    while ((searchQuery = br.readLine()) != null) {
-                        searchQuery = searchQuery.trim();
+                    while ((line = br.readLine()) != null) {
+                        JsonObject searchQuery = JsonParser.parseString(line).getAsJsonObject();
+                        String keyword = searchQuery.get("keyword").getAsString();
+                        String category = searchQuery.get("category").getAsString();
 
-                        if (!searchQuery.isEmpty()) {
-                            System.out.println("Searching for: " + searchQuery);
-                            JsonArray posts = searchPosts(accessToken, searchQuery);
+                        if (!keyword.isEmpty()) {
+                            System.out.println("Searching for: " + keyword);
+                            JsonArray posts = searchPosts(accessToken, keyword);
                             if (posts.size() > 0) {
-                                DatabaseService.saveRedditPosts(posts, searchQuery);
+                                DatabaseService.saveRedditPosts(posts, keyword, category);
                             }
                             long delay = ThreadLocalRandom.current().nextLong(300000, 600001);
                             System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next keyword...");

@@ -54,27 +54,27 @@ public class InstagramService implements SocialMediaScanner {
         }
     }
 
-    private static List<String> loadKeywords() throws Exception {
-        List<String> keywords = new ArrayList<>();
+    private static List<JsonObject> loadInputQueries() throws Exception {
+        List<JsonObject> inputQueries = new ArrayList<>();
         try (InputStream input = InstagramService.class.getClassLoader().getResourceAsStream("search_queries.txt")) {
             if (input == null) {
                 System.out.println("Sorry, unable to find search_queries.txt");
-                return keywords;
+                return inputQueries;
             }
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(input))) {
-                keywords = reader.lines()
-                        .map(line -> line.trim().replaceAll("\\s+", "").toLowerCase())
+                inputQueries = reader.lines()
+                        .map(line -> JsonParser.parseString(line).getAsJsonObject())
                         .collect(Collectors.toList());
             }
         }
-        return keywords;
+        return inputQueries;
     }
 
-    public static void search(String query) throws Exception {
+    public static void search(String query, String category) throws Exception {
         String hashtagId = getHashtagId(query);
         if (hashtagId != null) {
             System.out.println("Found Hashtag ID for '" + query + "': " + hashtagId);
-            getHashtagMedia(hashtagId, query);
+            getHashtagMedia(hashtagId, query, category);
         }
     }
 
@@ -100,7 +100,7 @@ public class InstagramService implements SocialMediaScanner {
         return null;
     }
 
-    private static void getHashtagMedia(String hashtagId, String query) throws Exception {
+    private static void getHashtagMedia(String hashtagId, String query, String category) throws Exception {
         System.out.println("\nRetrieving latest " + numberOfPosts + " posts for '" + query + "'...");
 
         String fields = "id,caption,media_type,media_url,permalink,timestamp,username,like_count,comments_count";
@@ -114,7 +114,7 @@ public class InstagramService implements SocialMediaScanner {
         System.out.println(gson.toJson(response));
 
         if (response != null && response.has("data")) {
-            DatabaseService.saveInstagramPosts(response.getAsJsonArray("data"), query);
+            DatabaseService.saveInstagramPosts(response.getAsJsonArray("data"), query, category);
         }
     }
 
@@ -154,11 +154,13 @@ public class InstagramService implements SocialMediaScanner {
         try {
             loadConfig();
             System.out.println("Initializing Instagram Search...");
-            List<String> keywords = loadKeywords();
+            List<JsonObject> inputQueries = loadInputQueries();
 
-            for (String keyword : keywords) {
+            for (JsonObject inputQuery : inputQueries) {
+                String keyword = inputQuery.get("keyword").getAsString();
+                String category = inputQuery.get("category").getAsString();
                 System.out.println("\nProcessing keyword: " + keyword);
-                search(keyword);
+                search(keyword, category);
                 long delay = ThreadLocalRandom.current().nextLong(300000, 600001);
                 System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next keyword...");
                 Thread.sleep(delay);

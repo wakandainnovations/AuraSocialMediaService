@@ -7,6 +7,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.lit.fire.api.SocialMediaScanner;
 
 import java.io.BufferedReader;
@@ -43,23 +44,23 @@ public class YouTubeMain implements SocialMediaScanner {
         }
     }
 
-    private static List<String> loadKeywords() throws Exception {
-        List<String> keywords = new ArrayList<>();
+    private static List<JsonObject> loadInputQueries() throws Exception {
+        List<JsonObject> inputQueries = new ArrayList<>();
         try (InputStream input = YouTubeMain.class.getClassLoader().getResourceAsStream("search_queries.txt")) {
             if (input == null) {
                 System.out.println("Sorry, unable to find search_queries.txt");
-                return keywords;
+                return inputQueries;
             }
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(input))) {
-                keywords = reader.lines()
-                        .map(line -> line.trim().replaceAll("\\s+", "").toLowerCase())
+                inputQueries = reader.lines()
+                        .map(line -> JsonParser.parseString(line).getAsJsonObject())
                         .collect(Collectors.toList());
             }
         }
-        return keywords;
+        return inputQueries;
     }
 
-    public static void search(String query) throws Exception {
+    public static void search(String query, String category) throws Exception {
         System.out.println("\nRetrieving latest " + numberOfVideos + " videos for '" + query + "'...");
 
         YouTubeService service = new YouTubeService("YouTubeSearchApp", API_KEY);
@@ -100,7 +101,7 @@ public class YouTubeMain implements SocialMediaScanner {
         }
 
         if (videoComments.size() > 0) {
-            DatabaseService.saveYouTubeComments(videoComments, query);
+            DatabaseService.saveYouTubeComments(videoComments, query, category);
         }
     }
 
@@ -109,11 +110,13 @@ public class YouTubeMain implements SocialMediaScanner {
         try {
             loadConfig();
             System.out.println("Initializing YouTube Search...");
-            List<String> keywords = loadKeywords();
+            List<JsonObject> inputQueries = loadInputQueries();
 
-            for (String keyword : keywords) {
+            for (JsonObject inputQuery : inputQueries) {
+                String keyword = inputQuery.get("keyword").getAsString();
+                String category = inputQuery.get("category").getAsString();
                 System.out.println("\nProcessing keyword: " + keyword);
-                search(keyword);
+                search(keyword, category);
             }
 
         } catch (Exception e) {
