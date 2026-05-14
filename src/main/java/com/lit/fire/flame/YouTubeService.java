@@ -1,6 +1,7 @@
 package com.lit.fire.flame;
 
 import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport;
+import com.google.api.client.googleapis.json.GoogleJsonResponseException;
 import com.google.api.client.http.HttpTransport;
 import com.google.api.client.json.JsonFactory;
 import com.google.api.client.json.gson.GsonFactory;
@@ -102,12 +103,13 @@ public class YouTubeService {
      * @param maxResults The maximum number of comments to return (1-100).
      * @return A list of CommentThread objects, or an empty list if no results are found or an error occurs.
      */
-    public List<CommentThread> getComments(String videoId, long maxResults) {
+    public List<CommentThread> getComments(String videoId, long maxResults, String lastETag) {
         try {
             System.out.println("Fetching comments for video ID: " + videoId);
 
             YouTube.CommentThreads.List request = youtubeService.commentThreads()
-                    .list("snippet,replies");
+//                    .list("snippet,replies");
+                    .list("snippet");
 
             request.setKey(apiKey);
             request.setVideoId(videoId);
@@ -115,15 +117,39 @@ public class YouTubeService {
             request.setOrder("time"); // To get the latest comments
             request.setTextFormat("plainText");
 
-            long delay = ThreadLocalRandom.current().nextLong(300000, 600001);
-            System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next keyword...");
-            Thread.sleep(delay);
+            // *******************************************
+            // SME Recommendation: Use the generic .set() method to avoid List-to-String ambiguity
+            if (lastETag != null && !lastETag.isEmpty()) {
+                // We pass the ETag inside a List to comply with HTTP multi-value header standards
+                request.getRequestHeaders().set("If-None-Match", Collections.singletonList(lastETag));
+            }
+            // *******************************************
+
+//            long delay = ThreadLocalRandom.current().nextLong(300000, 600001);
+//            System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next keyword...");
+//            Thread.sleep(delay);
             CommentThreadListResponse response = request.execute();
+
+            // ******************************************
+            // Update your DB with the new ETag for the next run
+            String newETag = response.getEtag();
+            if (newETag != null) {
+                lastETag = newETag;
+            }
+            // ******************************************
             List<CommentThread> items = response.getItems();
             if (items != null) {
                 return items;
             }
 
+        } catch (GoogleJsonResponseException e) {
+            if (e.getStatusCode() == 304) {
+                System.out.println("No new comments for video: " + videoId + " (Quota saved!)");
+                return Collections.emptyList();
+            }
+            if (e.getStatusCode() == 403) {
+                System.err.println("Comments disabled for video: " + videoId);
+            }
         } catch (IOException e) {
             System.err.println("An IO error occurred while fetching comments: " + e.getMessage());
             // It can be a 403 error if comments are disabled for the video.

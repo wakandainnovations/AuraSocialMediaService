@@ -7,6 +7,7 @@ import java.io.InputStream;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
@@ -15,6 +16,23 @@ import java.time.format.DateTimeFormatter;
 import java.util.Properties;
 
 public class DatabaseService {
+
+    private static Connection getConnection() throws SQLException {
+        Properties dbProperties = null;
+        try {
+            dbProperties = loadDbProperties();
+        } catch (Exception e) {
+            throw new SQLException("Failed to load db properties", e);
+        }
+        if (dbProperties == null) {
+            throw new SQLException("db properties are null");
+        }
+
+        String dbUrl = dbProperties.getProperty("db.url", "jdbc:postgresql://localhost:5432/aura");
+        String dbUser = dbProperties.getProperty("db.user", "postgres");
+        String dbPassword = dbProperties.getProperty("db.password", "postgres");
+        return DriverManager.getConnection(dbUrl, dbUser, dbPassword);
+    }
 
     private static Properties loadDbProperties() throws Exception {
         Properties properties = new Properties();
@@ -29,18 +47,9 @@ public class DatabaseService {
     }
 
     public static void saveInstagramPosts(JsonArray posts, String keyword, String category) throws Exception {
-        Properties dbProperties = loadDbProperties();
-        if (dbProperties == null) {
-            return;
-        }
-
-        String dbUrl = dbProperties.getProperty("db.url", "jdbc:postgresql://localhost:5432/aura");
-        String dbUser = dbProperties.getProperty("db.user", "postgres");
-        String dbPassword = dbProperties.getProperty("db.password", "postgres");
-
         String sql = "INSERT INTO instagram_posts (id, text, media_type, media_url, permalink, timestamp, keyword, sentiment_category, author, like_count, comments_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
 
-        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword);
+        try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
 
             DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssZ");
@@ -76,18 +85,9 @@ public class DatabaseService {
     }
 
     public static void saveXPosts(JsonArray posts, String keyword, String category) throws Exception {
-        Properties dbProperties = loadDbProperties();
-        if (dbProperties == null) {
-            return;
-        }
+        String sql = "INSERT INTO x_posts (id, text, created_at, keyword, sentiment_category, permalink, author, likes_count, comment_count, views_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
 
-        String dbUrl = dbProperties.getProperty("db.url", "jdbc:postgresql://localhost:5432/aura");
-        String dbUser = dbProperties.getProperty("db.user", "postgres");
-        String dbPassword = dbProperties.getProperty("db.password", "postgres");
-
-        String sql = "INSERT INTO x_posts (id, text, created_at, keyword, sentiment_category, permalink, author, likes_count, comment_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
-
-        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword);
+        try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
             int savedPosts = 0;
             for (JsonElement postElement : posts) {
@@ -121,6 +121,7 @@ public class DatabaseService {
                 pstmt.setString(7, post.has("author") ? post.get("author").getAsString() : null);
                 pstmt.setInt(8, post.has("likes_count") ? post.get("likes_count").getAsInt() : 0);
                 pstmt.setInt(9, post.has("comment_count") ? post.get("comment_count").getAsInt() : 0);
+                pstmt.setInt(10, post.has("views_count") ? post.get("views_count").getAsInt() : 0);
 
                 pstmt.addBatch();
                 savedPosts++;
@@ -136,18 +137,9 @@ public class DatabaseService {
     }
 
     public static void saveYouTubeComments(JsonArray comments, String keyword, String category) throws Exception {
-        Properties dbProperties = loadDbProperties();
-        if (dbProperties == null) {
-            return;
-        }
-
-        String dbUrl = dbProperties.getProperty("db.url", "jdbc:postgresql://localhost:5432/aura");
-        String dbUser = dbProperties.getProperty("db.user", "postgres");
-        String dbPassword = dbProperties.getProperty("db.password", "postgres");
-
         String sql = "INSERT INTO youtube_comments (id, video_id, video_title, text, author, published_at, permalink, keyword, sentiment_category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
 
-        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword);
+        try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
 
             for (JsonElement commentElement : comments) {
@@ -179,18 +171,9 @@ public class DatabaseService {
     }
 
     public static void saveRedditPosts(JsonArray posts, String keyword, String category) throws Exception {
-        Properties dbProperties = loadDbProperties();
-        if (dbProperties == null) {
-            return;
-        }
-
-        String dbUrl = dbProperties.getProperty("db.url", "jdbc:postgresql://localhost:5432/aura");
-        String dbUser = dbProperties.getProperty("db.user", "postgres");
-        String dbPassword = dbProperties.getProperty("db.password", "postgres");
-
         String sql = "INSERT INTO reddit_posts (id, title, text, created_at, keyword, sentiment_category, permalink, author, score, num_comments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
 
-        try (Connection conn = DriverManager.getConnection(dbUrl, dbUser, dbPassword);
+        try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
 
             for (JsonElement postElement : posts) {
@@ -215,6 +198,68 @@ public class DatabaseService {
             pstmt.executeBatch();
             System.out.println("Successfully saved " + posts.size() + " Reddit posts to the database.");
 
+        } catch (SQLException e) {
+            System.err.println("Database error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    public static String getVideoETag(String videoId) {
+        String sql = "SELECT etag FROM video_etags WHERE video_id = ?";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, videoId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getString("etag");
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Database error: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    public static void saveVideoETag(String videoId, String newETag) {
+        String sql = "INSERT INTO video_etags (video_id, etag) VALUES (?, ?) ON CONFLICT (video_id) DO UPDATE SET etag = ?";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, videoId);
+            pstmt.setString(2, newETag);
+            pstmt.setString(3, newETag);
+            pstmt.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Database error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    public static String getLastXPostId(String keyword) {
+        String sql = "SELECT post_id FROM x_post_ids WHERE keyword = ?";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, keyword);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    return rs.getString("post_id");
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Database error: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    public static void saveLastXPostId(String keyword, String newestId) {
+        String sql = "INSERT INTO x_post_ids (keyword, post_id) VALUES (?, ?) ON CONFLICT (keyword) DO UPDATE SET post_id = ?";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, keyword);
+            pstmt.setString(2, newestId);
+            pstmt.setString(3, newestId);
+            pstmt.executeUpdate();
         } catch (SQLException e) {
             System.err.println("Database error: " + e.getMessage());
             e.printStackTrace();

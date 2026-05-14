@@ -1,5 +1,6 @@
 package com.lit.fire.flame;
 
+import com.google.api.client.googleapis.json.GoogleJsonResponseException;
 import com.google.api.services.youtube.model.CommentSnippet;
 import com.google.api.services.youtube.model.CommentThread;
 import com.google.api.services.youtube.model.SearchResult;
@@ -16,6 +17,10 @@ import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public class YouTubeMain implements SocialMediaScanner {
@@ -23,6 +28,7 @@ public class YouTubeMain implements SocialMediaScanner {
     private static String API_KEY;
     private static int numberOfVideos;
     private static int numberOfComments;
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
 
     private static void loadConfig() throws Exception {
         Properties properties = new Properties();
@@ -77,12 +83,21 @@ public class YouTubeMain implements SocialMediaScanner {
         for (SearchResult video : videos) {
             String videoId = video.getId().getVideoId();
             System.out.println("\nFetching " + numberOfComments + " comments for video: " + video.getSnippet().getTitle() + " (ID: " + videoId + ")");
-            List<CommentThread> comments = service.getComments(videoId, numberOfComments);
+
+            // *******************************************
+            // 1. Retrieve the last ETag from your DB for this specific video
+            String lastETag = DatabaseService.getVideoETag(videoId);
+            // *******************************************
+            List<CommentThread> comments = service.getComments(videoId, numberOfComments, lastETag);
 
             if (comments.isEmpty()) {
                 System.out.println("No comments found for video ID: " + videoId);
                 continue;
             }
+
+            // Capture the NEW ETag from the first item to use for the next hourly poll
+            String newETag = comments.get(0).getEtag();
+            DatabaseService.saveVideoETag(videoId, newETag);
 
             for (CommentThread commentThread : comments) {
                 CommentSnippet snippet = commentThread.getSnippet().getTopLevelComment().getSnippet();
@@ -115,9 +130,25 @@ public class YouTubeMain implements SocialMediaScanner {
             for (JsonObject inputQuery : inputQueries) {
                 String keyword = inputQuery.get("keyword").getAsString();
                 String category = inputQuery.get("category").getAsString();
+                // SME Recommendation: Randomize initial delay so keywords don't all hit the API at once
+                long initialDelay = ThreadLocalRandom.current().nextLong(0, 60);
                 System.out.println("\nProcessing keyword: " + keyword);
-                search(keyword, category);
-            }
+                // Schedule the task to run every 1 hour (3600 seconds)
+                scheduler.scheduleAtFixedRate(() -> {
+                    try {
+                        System.out.println("\n[Scheduled Task] Starting: " + keyword);
+                        search(keyword, category);
+                    } catch (GoogleJsonResponseException e) {
+                        if (e.getDetails() != null && e.getDetails().getCode() == 403 && e.getDetails().getMessage().contains("quota")) {
+                            System.err.println("YouTube API quota exceeded. Shutting down all tasks.");
+                            scheduler.shutdown();
+                        } else {
+                            System.err.println("Google API error for " + keyword + ": " + e.getMessage());
+                        }
+                    } catch (Exception e) {
+                        System.err.println("Error in scheduled task for " + keyword + ": " + e.getMessage());
+                    }
+                }, initialDelay, 3600, TimeUnit.SECONDS);            }
 
         } catch (Exception e) {
             System.err.println("An unrecoverable error occurred during the process.");
