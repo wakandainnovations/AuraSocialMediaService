@@ -189,6 +189,7 @@ public class RedditAuthClientWithSearch implements SocialMediaScanner {
                         String category = searchQuery.get("category").getAsString();
 
                         if (!keyword.isEmpty()) {
+                            DatabaseService.upsertEntityKeyword(searchQuery);
                             System.out.println("Searching for: " + keyword);
                             JsonArray posts = searchPosts(accessToken, keyword);
                             if (posts.size() > 0) {

@@ -252,6 +252,29 @@ public class DatabaseService {
         return null;
     }
 
+    public static void upsertEntityKeyword(JsonObject inputQuery) {
+        String keyword = inputQuery.get("keyword").getAsString();
+        String category = inputQuery.has("category") ? inputQuery.get("category").getAsString() : null;
+        String language = inputQuery.has("language") ? inputQuery.get("language").getAsString() : null;
+        String state = inputQuery.has("state") ? inputQuery.get("state").getAsString() : null;
+        String industry = inputQuery.has("industry") ? inputQuery.get("industry").getAsString() : null;
+
+        String sql = "INSERT INTO entity_keywords (keyword, category, language, state, industry) VALUES (?, ?, ?, ?, ?) " +
+                "ON CONFLICT (keyword) DO UPDATE SET category = EXCLUDED.category, language = EXCLUDED.language, state = EXCLUDED.state, industry = EXCLUDED.industry";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, keyword);
+            pstmt.setString(2, category);
+            pstmt.setString(3, language);
+            pstmt.setString(4, state);
+            pstmt.setString(5, industry);
+            pstmt.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Database error upserting entity_keyword '" + keyword + "': " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
     public static void saveLastXPostId(String keyword, String newestId) {
         String sql = "INSERT INTO x_post_ids (keyword, post_id) VALUES (?, ?) ON CONFLICT (keyword) DO UPDATE SET post_id = ?";
         try (Connection conn = getConnection();

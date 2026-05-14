@@ -159,6 +159,7 @@ public class InstagramService implements SocialMediaScanner {
             for (JsonObject inputQuery : inputQueries) {
                 String keyword = inputQuery.get("keyword").getAsString();
                 String category = inputQuery.get("category").getAsString();
+                DatabaseService.upsertEntityKeyword(inputQuery);
                 System.out.println("\nProcessing keyword: " + keyword);
                 search(keyword, category);
                 long delay = ThreadLocalRandom.current().nextLong(300000, 600001);

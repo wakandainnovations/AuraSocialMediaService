@@ -130,6 +130,7 @@ public class YouTubeMain implements SocialMediaScanner {
             for (JsonObject inputQuery : inputQueries) {
                 String keyword = inputQuery.get("keyword").getAsString();
                 String category = inputQuery.get("category").getAsString();
+                DatabaseService.upsertEntityKeyword(inputQuery);
                 // SME Recommendation: Randomize initial delay so keywords don't all hit the API at once
                 long initialDelay = ThreadLocalRandom.current().nextLong(0, 60);
                 System.out.println("\nProcessing keyword: " + keyword);
