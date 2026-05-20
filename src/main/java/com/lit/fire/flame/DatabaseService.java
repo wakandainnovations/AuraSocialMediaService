@@ -13,9 +13,18 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 
 public class DatabaseService {
+
+    // Tunable: weight comments higher than likes in the traction score.
+    private static final int COMMENT_WEIGHT = 3;
+    // Tunable: a post is considered to "have traction" if score strictly exceeds this.
+    private static final int TRACTION_THRESHOLD = 0;
 
     private static Connection getConnection() throws SQLException {
         Properties dbProperties = null;
@@ -253,24 +262,110 @@ public class DatabaseService {
     }
 
     public static void upsertEntityKeyword(JsonObject inputQuery) {
-        String keyword = inputQuery.get("keyword").getAsString();
-        String category = inputQuery.has("category") ? inputQuery.get("category").getAsString() : null;
-        String language = inputQuery.has("language") ? inputQuery.get("language").getAsString() : null;
-        String state = inputQuery.has("state") ? inputQuery.get("state").getAsString() : null;
-        String industry = inputQuery.has("industry") ? inputQuery.get("industry").getAsString() : null;
+//        String keyword = inputQuery.get("keyword").getAsString();
+//        String category = inputQuery.has("category") ? inputQuery.get("category").getAsString() : null;
+//        String language = inputQuery.has("language") ? inputQuery.get("language").getAsString() : null;
+//        String state = inputQuery.has("state") ? inputQuery.get("state").getAsString() : null;
+//        String industry = inputQuery.has("industry") ? inputQuery.get("industry").getAsString() : null;
+//
+//        String sql = "INSERT INTO entity_keywords (keyword, category, language, state, industry) VALUES (?, ?, ?, ?, ?) " +
+//                "ON CONFLICT (keyword) DO UPDATE SET category = EXCLUDED.category, language = EXCLUDED.language, state = EXCLUDED.state, industry = EXCLUDED.industry";
+//        try (Connection conn = getConnection();
+//             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+//            pstmt.setString(1, keyword);
+//            pstmt.setString(2, category);
+//            pstmt.setString(3, language);
+//            pstmt.setString(4, state);
+//            pstmt.setString(5, industry);
+//            pstmt.executeUpdate();
+//        } catch (SQLException e) {
+//            System.err.println("Database error upserting entity_keyword '" + keyword + "': " + e.getMessage());
+//            e.printStackTrace();
+//        }
+    }
 
-        String sql = "INSERT INTO entity_keywords (keyword, category, language, state, industry) VALUES (?, ?, ?, ?, ?) " +
-                "ON CONFLICT (keyword) DO UPDATE SET category = EXCLUDED.category, language = EXCLUDED.language, state = EXCLUDED.state, industry = EXCLUDED.industry";
+    /**
+     * Returns rows due for a metrics refresh, tiered by age + existing traction:
+     *  - Tier A (created within last 2h): refresh up to once per hour, regardless of traction.
+     *  - Tier B (older than 2h, has traction, within 7d): refresh once per 12h.
+     *  - Tier C (older than 2h, no traction): excluded — never refreshed again.
+     * Each row gives both the composite DB id and the underlying X tweet id.
+     */
+    public static List<Map<String, String>> getXPostsDueForRefresh(int maxRows) {
+        String sql =
+            "SELECT id, split_part(id, '_', 1) AS x_id " +
+            "FROM x_posts " +
+            "WHERE " +
+            // Tier A — discovery window
+            "  (created_at > NOW() - INTERVAL '2 hours' " +
+            "   AND (last_refreshed_at IS NULL " +
+            "        OR last_refreshed_at < NOW() - INTERVAL '55 minutes')) " +
+            "OR " +
+            // Tier B — proven traction, mature posts (cap at 7d)
+            "  (created_at <= NOW() - INTERVAL '2 hours' " +
+            "   AND created_at > NOW() - INTERVAL '7 days' " +
+            "   AND (likes_count + comment_count * " + COMMENT_WEIGHT + ") > " + TRACTION_THRESHOLD + " " +
+            "   AND (last_refreshed_at IS NULL " +
+            "        OR last_refreshed_at < NOW() - INTERVAL '12 hours')) " +
+            "LIMIT ?";
+
+        List<Map<String, String>> rows = new ArrayList<>();
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, keyword);
-            pstmt.setString(2, category);
-            pstmt.setString(3, language);
-            pstmt.setString(4, state);
-            pstmt.setString(5, industry);
-            pstmt.executeUpdate();
+            pstmt.setInt(1, maxRows);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    Map<String, String> row = new HashMap<>();
+                    row.put("composite_id", rs.getString("id"));
+                    row.put("x_id", rs.getString("x_id"));
+                    rows.add(row);
+                }
+            }
         } catch (SQLException e) {
-            System.err.println("Database error upserting entity_keyword '" + keyword + "': " + e.getMessage());
+            System.err.println("Database error in getXPostsDueForRefresh: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return rows;
+    }
+
+    // Bumps last_refreshed_at on every candidate row, including those X dropped (deleted/private),
+    // so they don't re-enter the candidate set on the next cycle.
+    public static void markRefreshAttempted(List<String> compositeIds) {
+        if (compositeIds.isEmpty()) return;
+        String sql = "UPDATE x_posts SET last_refreshed_at = NOW() WHERE id = ?";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            for (String id : compositeIds) {
+                pstmt.setString(1, id);
+                pstmt.addBatch();
+            }
+            pstmt.executeBatch();
+        } catch (SQLException e) {
+            System.err.println("Database error in markRefreshAttempted: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    // metricsByXId: x_id -> [likes, comments, views]. Same X tweet may map to multiple rows
+    // (one per keyword), so we match by the X-side prefix of the composite id.
+    public static void updateXPostMetrics(Map<String, int[]> metricsByXId) {
+        if (metricsByXId.isEmpty()) return;
+        String sql = "UPDATE x_posts SET likes_count = ?, comment_count = ?, views_count = ?, " +
+                     "last_refreshed_at = NOW() WHERE split_part(id, '_', 1) = ?";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            for (Map.Entry<String, int[]> e : metricsByXId.entrySet()) {
+                int[] m = e.getValue();
+                pstmt.setInt(1, m[0]);
+                pstmt.setInt(2, m[1]);
+                pstmt.setInt(3, m[2]);
+                pstmt.setString(4, e.getKey());
+                pstmt.addBatch();
+            }
+            pstmt.executeBatch();
+            System.out.println("Metrics refreshed for " + metricsByXId.size() + " distinct X posts.");
+        } catch (SQLException e) {
+            System.err.println("Database error in updateXPostMetrics: " + e.getMessage());
             e.printStackTrace();
         }
     }

@@ -34,6 +34,11 @@ public class XService implements SocialMediaScanner {
     private static final String API_URL = "https://api.x.com/2";
     private static int numberOfPosts;
 
+    // X API hard cap for batched tweet lookups
+    private static final int LOOKUP_BATCH_SIZE = 100;
+    // Ceiling on post-reads spent per hourly refresh cycle
+    private static final int MAX_REFRESH_PER_CYCLE = 100;
+
     private static void loadConfig() throws Exception {
         Properties properties = new Properties();
         try (InputStream input = XService.class.getClassLoader().getResourceAsStream("secrets.properties")) {
@@ -151,6 +156,58 @@ public class XService implements SocialMediaScanner {
         }
     }
 
+    /**
+     * Refreshes likes/comments/views on previously-collected posts using the batched
+     * /2/tweets?ids= lookup (up to 100 IDs per HTTP call). Candidate posts come from
+     * DatabaseService.getXPostsDueForRefresh(...), which enforces the tiered policy:
+     *  - Discovery (< 2h old):        refreshed up to once per hour, regardless of traction.
+     *  - Traction (>= 2h, > 0 score): refreshed once per 12h, up to 7 days.
+     *  - No traction past 2h:         never refreshed (zero cost).
+     */
+    public static void refreshMetrics() throws Exception {
+        List<Map<String, String>> due = DatabaseService.getXPostsDueForRefresh(MAX_REFRESH_PER_CYCLE);
+        if (due.isEmpty()) {
+            System.out.println("[Aura-X Refresh] Nothing due.");
+            return;
+        }
+
+        // A single X tweet may live under several keywords/composite rows; dedupe for the API call.
+        Set<String> distinctXIds = new LinkedHashSet<>();
+        List<String> compositeIds = new ArrayList<>();
+        for (Map<String, String> row : due) {
+            distinctXIds.add(row.get("x_id"));
+            compositeIds.add(row.get("composite_id"));
+        }
+        System.out.println("[Aura-X Refresh] candidates: " + compositeIds.size()
+                + " rows / " + distinctXIds.size() + " distinct tweets.");
+
+        Map<String, int[]> metricsByXId = new HashMap<>();
+        List<String> xIdList = new ArrayList<>(distinctXIds);
+        for (int i = 0; i < xIdList.size(); i += LOOKUP_BATCH_SIZE) {
+            List<String> chunk = xIdList.subList(i, Math.min(i + LOOKUP_BATCH_SIZE, xIdList.size()));
+            String url = String.format("%s/tweets?ids=%s&tweet.fields=public_metrics",
+                    API_URL, String.join(",", chunk));
+
+            JsonObject resp = sendRequest(url);
+            if (resp == null || !resp.has("data")) continue;
+
+            for (JsonElement el : resp.getAsJsonArray("data")) {
+                JsonObject t = el.getAsJsonObject();
+                if (!t.has("public_metrics")) continue;
+                JsonObject pm = t.getAsJsonObject("public_metrics");
+                int likes    = pm.has("like_count")       ? pm.get("like_count").getAsInt()       : 0;
+                int comments = pm.has("reply_count")      ? pm.get("reply_count").getAsInt()      : 0;
+                int views    = pm.has("impression_count") ? pm.get("impression_count").getAsInt() : 0;
+                metricsByXId.put(t.get("id").getAsString(), new int[]{likes, comments, views});
+            }
+            // Deleted/private IDs come back in `errors[]` and are simply absent from `data`.
+        }
+
+        // Mark all candidates as attempted first, so dead IDs don't re-enter next cycle.
+        DatabaseService.markRefreshAttempted(compositeIds);
+        DatabaseService.updateXPostMetrics(metricsByXId);
+    }
+
     private static JsonObject sendRequest(String url) throws Exception {
         HttpClient client = HttpClient.newHttpClient();
         HttpRequest request = HttpRequest.newBuilder()
@@ -222,6 +279,15 @@ public class XService implements SocialMediaScanner {
 //                System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next keyword...");
 //                Thread.sleep(delay);
             }
+
+            // Hourly metrics refresh across all previously-collected posts (tiered policy in SQL).
+            scheduler.scheduleAtFixedRate(() -> {
+                try {
+                    refreshMetrics();
+                } catch (Exception e) {
+                    System.err.println("refreshMetrics failed: " + e.getMessage());
+                }
+            }, 600, 3600, TimeUnit.SECONDS);
 
         } catch (Exception e) {
             System.err.println("An unrecoverable error occurred during the process.");
