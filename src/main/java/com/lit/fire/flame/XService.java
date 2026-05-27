@@ -90,7 +90,20 @@ public class XService implements SocialMediaScanner {
             searchUrl = String.format("%s/tweets/search/recent?query=%s&since_id=%s&tweet.fields=%s&expansions=%s&user.fields=%s&max_results=%d",
                     API_URL, encodedQuery, lastPostId, fields, expansions, userFields, numberOfPosts);
         }
-        JsonObject response = sendRequest(searchUrl);
+        JsonObject response;
+        try {
+            response = sendRequest(searchUrl);
+        } catch (RuntimeException e) {
+            if (e.getMessage() != null && e.getMessage().contains("since_id")) {
+                String correctedId = extractCorrectedSinceId(e.getMessage());
+                if (correctedId != null) {
+                    System.err.println("Stale since_id for '" + keyword + "'. Updated to " + correctedId + " (30-min buffer) for next poll.");
+                    DatabaseService.saveLastXPostId(keyword, correctedId);
+                }
+                return;
+            }
+            throw e;
+        }
 
         if (response != null && response.has("meta")) {
             JsonObject meta = response.getAsJsonObject("meta");
@@ -206,6 +219,24 @@ public class XService implements SocialMediaScanner {
         // Mark all candidates as attempted first, so dead IDs don't re-enter next cycle.
         DatabaseService.markRefreshAttempted(compositeIds);
         DatabaseService.updateXPostMetrics(metricsByXId);
+    }
+
+    private static String extractCorrectedSinceId(String errorMessage) {
+        try {
+            String marker = "larger than ";
+            int idx = errorMessage.indexOf(marker);
+            if (idx == -1) return null;
+            int start = idx + marker.length();
+            int end = start;
+            while (end < errorMessage.length() && Character.isDigit(errorMessage.charAt(end))) end++;
+            long minSinceId = Long.parseLong(errorMessage.substring(start, end));
+            // Twitter snowflake: timestamp_ms occupies bits 63-22.
+            // 30 minutes = 1,800,000 ms; shift left 22 to get the ID-space offset.
+            long thirtyMinOffset = 30L * 60 * 1000 * (1L << 22);
+            return String.valueOf(minSinceId + thirtyMinOffset);
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     private static JsonObject sendRequest(String url) throws Exception {
