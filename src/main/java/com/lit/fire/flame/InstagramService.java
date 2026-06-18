@@ -18,8 +18,12 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
@@ -70,11 +74,40 @@ public class InstagramService implements SocialMediaScanner {
         return inputQueries;
     }
 
-    public static void search(String query, String category) throws Exception {
-        String hashtagId = getHashtagId(query);
-        if (hashtagId != null) {
-            System.out.println("Found Hashtag ID for '" + query + "': " + hashtagId);
-            getHashtagMedia(hashtagId, query, category);
+    /**
+     * Searches Instagram for a single entity. Hashtag search is one API call per hashtag (the Graph
+     * API can't OR hashtags into one call), but a post tagged with several of the entity's hashtags is
+     * collected only once: we track seen post ids across the entity's hashtags and store per entity
+     * (composite id postId_entity in saveInstagramPosts(...)), so it isn't stored or re-analyzed twice.
+     */
+    public static void search(String entity, List<String> keywords, String category) throws Exception {
+        JsonArray entityPosts = new JsonArray();
+        Set<String> seenPostIds = new HashSet<>();
+
+        for (int i = 0; i < keywords.size(); i++) {
+            String keyword = keywords.get(i);
+            String hashtagId = getHashtagId(keyword);
+            if (hashtagId != null) {
+                System.out.println("Found Hashtag ID for '" + keyword + "': " + hashtagId);
+                JsonArray media = getHashtagMedia(hashtagId, keyword);
+                for (JsonElement el : media) {
+                    JsonObject post = el.getAsJsonObject();
+                    // Dedupe within the entity so a post under several of its hashtags is kept once.
+                    if (post.has("id") && seenPostIds.add(post.get("id").getAsString())) {
+                        entityPosts.add(post);
+                    }
+                }
+            }
+            // Space out hashtag lookups within an entity to respect rate limits.
+            if (i < keywords.size() - 1) {
+                long delay = ThreadLocalRandom.current().nextLong(300000, 600001);
+                System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next hashtag...");
+                Thread.sleep(delay);
+            }
+        }
+
+        if (entityPosts.size() > 0) {
+            DatabaseService.saveInstagramPosts(entityPosts, entity, keywords, category);
         }
     }
 
@@ -100,7 +133,7 @@ public class InstagramService implements SocialMediaScanner {
         return null;
     }
 
-    private static void getHashtagMedia(String hashtagId, String query, String category) throws Exception {
+    private static JsonArray getHashtagMedia(String hashtagId, String query) throws Exception {
         System.out.println("\nRetrieving latest " + numberOfPosts + " posts for '" + query + "'...");
 
         String fields = "id,caption,media_type,media_url,permalink,timestamp,username,like_count,comments_count";
@@ -114,8 +147,9 @@ public class InstagramService implements SocialMediaScanner {
         System.out.println(gson.toJson(response));
 
         if (response != null && response.has("data")) {
-            DatabaseService.saveInstagramPosts(response.getAsJsonArray("data"), query, category);
+            return response.getAsJsonArray("data");
         }
+        return new JsonArray();
     }
 
     private static JsonObject sendRequest(String url) throws Exception {
@@ -156,14 +190,27 @@ public class InstagramService implements SocialMediaScanner {
             System.out.println("Initializing Instagram Search...");
             List<JsonObject> inputQueries = loadInputQueries();
 
+            // Group keyword lines by entity and process once per entity so a post shared across the
+            // entity's hashtags is collected and stored only once.
+            Map<String, List<JsonObject>> queriesByEntity = new LinkedHashMap<>();
             for (JsonObject inputQuery : inputQueries) {
-                String keyword = inputQuery.get("keyword").getAsString();
-                String category = inputQuery.get("category").getAsString();
+                String entity = inputQuery.get("entity").getAsString();
+                queriesByEntity.computeIfAbsent(entity, k -> new ArrayList<>()).add(inputQuery);
                 DatabaseService.upsertEntityKeyword(inputQuery);
-                System.out.println("\nProcessing keyword: " + keyword);
-                search(keyword, category);
+            }
+
+            for (Map.Entry<String, List<JsonObject>> entry : queriesByEntity.entrySet()) {
+                String entity = entry.getKey();
+                List<JsonObject> queries = entry.getValue();
+                List<String> keywords = queries.stream()
+                        .map(q -> q.get("keyword").getAsString())
+                        .collect(Collectors.toList());
+                // Keyword lines of one entity share its category.
+                String category = queries.get(0).get("category").getAsString();
+                System.out.println("\nProcessing entity: " + entity + " -> keywords " + keywords);
+                search(entity, keywords, category);
                 long delay = ThreadLocalRandom.current().nextLong(300000, 600001);
-                System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next keyword...");
+                System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next entity...");
                 Thread.sleep(delay);
             }
 

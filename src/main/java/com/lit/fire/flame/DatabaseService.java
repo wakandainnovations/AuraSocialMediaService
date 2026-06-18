@@ -55,8 +55,25 @@ public class DatabaseService {
         return properties;
     }
 
-    public static void saveInstagramPosts(JsonArray posts, String keyword, String category) throws Exception {
-        String sql = "INSERT INTO instagram_posts (id, text, media_type, media_url, permalink, timestamp, keyword, sentiment_category, author, like_count, comments_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
+    // Records which of the entity's keywords literally appear in the given text (comma-joined),
+    // falling back to the entity name when none match (e.g. the keyword matched a hashtag/video
+    // rather than the body text). Mirrors the matched-keyword recording in saveXPosts(...).
+    private static String matchedKeywords(String text, String entity, List<String> keywords) {
+        if (text == null || keywords == null || keywords.isEmpty()) {
+            return entity;
+        }
+        String lowerText = text.toLowerCase();
+        String matched = keywords.stream()
+                .filter(kw -> lowerText.contains(kw.toLowerCase()))
+                .collect(java.util.stream.Collectors.joining(","));
+        return matched.isEmpty() ? entity : matched;
+    }
+
+    // Posts are keyed/deduped per entity: the composite id is postId_entity, so a post tagged with
+    // several of the entity's hashtags is stored once. The `keyword` column records which of the
+    // entity's keywords actually appear in the caption (comma-joined), falling back to the entity.
+    public static void saveInstagramPosts(JsonArray posts, String entity, List<String> keywords, String category) throws Exception {
+        String sql = "INSERT INTO instagram_posts (id, text, media_type, media_url, permalink, timestamp, entity, keyword, sentiment_category, author, like_count, comments_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
 
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -66,8 +83,9 @@ public class DatabaseService {
             for (JsonElement postElement : posts) {
                 JsonObject post = postElement.getAsJsonObject();
 
-                pstmt.setString(1, post.get("id").getAsString() + "_" + keyword);
-                pstmt.setString(2, post.has("caption") ? post.get("caption").getAsString() : null);
+                String caption = post.has("caption") ? post.get("caption").getAsString() : null;
+                pstmt.setString(1, post.get("id").getAsString() + "_" + entity);
+                pstmt.setString(2, caption);
                 pstmt.setString(3, post.get("media_type").getAsString());
                 pstmt.setString(4, post.has("media_url") ? post.get("media_url").getAsString() : null);
                 pstmt.setString(5, post.get("permalink").getAsString());
@@ -75,11 +93,12 @@ public class DatabaseService {
                 String timestampString = post.get("timestamp").getAsString();
                 ZonedDateTime zonedDateTime = ZonedDateTime.parse(timestampString, formatter);
                 pstmt.setTimestamp(6, Timestamp.from(zonedDateTime.toInstant()));
-                pstmt.setString(7, keyword);
-                pstmt.setString(8, category);
-                pstmt.setString(9, post.has("username") ? post.get("username").getAsString() : null);
-                pstmt.setInt(10, post.has("like_count") ? post.get("like_count").getAsInt() : 0);
-                pstmt.setInt(11, post.has("comments_count") ? post.get("comments_count").getAsInt() : 0);
+                pstmt.setString(7, entity);
+                pstmt.setString(8, matchedKeywords(caption, entity, keywords));
+                pstmt.setString(9, category);
+                pstmt.setString(10, post.has("username") ? post.get("username").getAsString() : null);
+                pstmt.setInt(11, post.has("like_count") ? post.get("like_count").getAsInt() : 0);
+                pstmt.setInt(12, post.has("comments_count") ? post.get("comments_count").getAsInt() : 0);
 
                 pstmt.addBatch();
             }
@@ -93,8 +112,12 @@ public class DatabaseService {
         }
     }
 
-    public static void saveXPosts(JsonArray posts, String keyword, String category) throws Exception {
-        String sql = "INSERT INTO x_posts (id, text, created_at, keyword, sentiment_category, permalink, author, likes_count, comment_count, views_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
+    // Posts are now keyed/deduped per entity: the composite id is tweetId_entity, so a tweet that
+    // matched several of the entity's keywords is stored once. The `keyword` column records which of
+    // the entity's keywords actually appear in the tweet text (comma-joined), falling back to the
+    // entity name if none match literally.
+    public static void saveXPosts(JsonArray posts, String entity, List<String> keywords, String category) throws Exception {
+        String sql = "INSERT INTO x_posts (id, text, created_at, entity, keyword, sentiment_category, permalink, author, likes_count, comment_count, views_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
 
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -103,14 +126,18 @@ public class DatabaseService {
                 JsonObject post = postElement.getAsJsonObject();
 
                 String text = post.has("text") ? post.get("text").getAsString() : null;
-                if (text != null && keyword != null && !keyword.isEmpty()) {
+                // Drop posts that merely @-mention a handle containing one of the entity's keywords.
+                if (text != null && keywords != null && !keywords.isEmpty()) {
                     java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("@[\\w_]+");
                     java.util.regex.Matcher matcher = pattern.matcher(text);
                     boolean foundBadHandle = false;
-                    while (matcher.find()) {
-                        if (matcher.group().toLowerCase().contains(keyword.toLowerCase())) {
-                            foundBadHandle = true;
-                            break;
+                    while (matcher.find() && !foundBadHandle) {
+                        String handle = matcher.group().toLowerCase();
+                        for (String kw : keywords) {
+                            if (handle.contains(kw.toLowerCase())) {
+                                foundBadHandle = true;
+                                break;
+                            }
                         }
                     }
                     if (foundBadHandle) {
@@ -118,19 +145,32 @@ public class DatabaseService {
                     }
                 }
 
-                pstmt.setString(1, post.get("id").getAsString() + "_" + keyword);
+                // Record which of the entity's keywords are present in the text.
+                String matchedKeywords = entity;
+                if (text != null && keywords != null && !keywords.isEmpty()) {
+                    String lowerText = text.toLowerCase();
+                    String matched = keywords.stream()
+                            .filter(kw -> lowerText.contains(kw.toLowerCase()))
+                            .collect(java.util.stream.Collectors.joining(","));
+                    if (!matched.isEmpty()) {
+                        matchedKeywords = matched;
+                    }
+                }
+
+                pstmt.setString(1, post.get("id").getAsString() + "_" + entity);
                 pstmt.setString(2, text);
-                
+
                 String timestampString = post.get("created_at").getAsString();
                 Instant instant = Instant.parse(timestampString);
                 pstmt.setTimestamp(3, Timestamp.from(instant));
-                pstmt.setString(4, keyword);
-                pstmt.setString(5, category);
-                pstmt.setString(6, post.has("permalink") ? post.get("permalink").getAsString() : null);
-                pstmt.setString(7, post.has("author") ? post.get("author").getAsString() : null);
-                pstmt.setInt(8, post.has("likes_count") ? post.get("likes_count").getAsInt() : 0);
-                pstmt.setInt(9, post.has("comment_count") ? post.get("comment_count").getAsInt() : 0);
-                pstmt.setInt(10, post.has("views_count") ? post.get("views_count").getAsInt() : 0);
+                pstmt.setString(4, entity);
+                pstmt.setString(5, matchedKeywords);
+                pstmt.setString(6, category);
+                pstmt.setString(7, post.has("permalink") ? post.get("permalink").getAsString() : null);
+                pstmt.setString(8, post.has("author") ? post.get("author").getAsString() : null);
+                pstmt.setInt(9, post.has("likes_count") ? post.get("likes_count").getAsInt() : 0);
+                pstmt.setInt(10, post.has("comment_count") ? post.get("comment_count").getAsInt() : 0);
+                pstmt.setInt(11, post.has("views_count") ? post.get("views_count").getAsInt() : 0);
 
                 pstmt.addBatch();
                 savedPosts++;
@@ -145,8 +185,13 @@ public class DatabaseService {
         }
     }
 
-    public static void saveYouTubeComments(JsonArray comments, String keyword, String category) throws Exception {
-        String sql = "INSERT INTO youtube_comments (id, video_id, video_title, text, author, published_at, permalink, keyword, sentiment_category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
+    // Comments are keyed/deduped per entity: the composite id is commentId_entity, so a comment on a
+    // video shared by several of the entity's keywords is stored once instead of once per keyword.
+    // The `keyword` column records which of the entity's keywords appear in the comment text
+    // (comma-joined), falling back to the entity name (the keyword usually matched the video, not
+    // the comment body).
+    public static void saveYouTubeComments(JsonArray comments, String entity, List<String> keywords, String category) throws Exception {
+        String sql = "INSERT INTO youtube_comments (id, video_id, video_title, text, author, published_at, permalink, entity, keyword, sentiment_category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
 
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -154,18 +199,20 @@ public class DatabaseService {
             for (JsonElement commentElement : comments) {
                 JsonObject comment = commentElement.getAsJsonObject();
 
-                pstmt.setString(1, comment.get("comment_id").getAsString() + "_" + keyword);
+                String text = comment.get("text").getAsString();
+                pstmt.setString(1, comment.get("comment_id").getAsString() + "_" + entity);
                 pstmt.setString(2, comment.get("video_id").getAsString());
                 pstmt.setString(3, comment.get("video_title").getAsString());
-                pstmt.setString(4, comment.get("text").getAsString());
+                pstmt.setString(4, text);
                 pstmt.setString(5, comment.get("author").getAsString());
 
                 String timestampString = comment.get("published_at").getAsString();
                 Instant instant = Instant.parse(timestampString);
                 pstmt.setTimestamp(6, Timestamp.from(instant));
                 pstmt.setString(7, comment.get("permalink").getAsString());
-                pstmt.setString(8, keyword);
-                pstmt.setString(9, category);
+                pstmt.setString(8, entity);
+                pstmt.setString(9, matchedKeywords(text, entity, keywords));
+                pstmt.setString(10, category);
 
                 pstmt.addBatch();
             }
@@ -179,8 +226,11 @@ public class DatabaseService {
         }
     }
 
-    public static void saveRedditPosts(JsonArray posts, String keyword, String category) throws Exception {
-        String sql = "INSERT INTO reddit_posts (id, title, text, created_at, keyword, sentiment_category, permalink, author, score, num_comments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
+    // Posts are keyed/deduped per entity: the composite id is postId_entity, so a post matching
+    // several of the entity's keywords (one OR'd search) is stored once. The `keyword` column records
+    // which of the entity's keywords appear in the title/body (comma-joined), falling back to entity.
+    public static void saveRedditPosts(JsonArray posts, String entity, List<String> keywords, String category) throws Exception {
+        String sql = "INSERT INTO reddit_posts (id, title, text, created_at, entity, keyword, sentiment_category, permalink, author, score, num_comments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
 
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -188,18 +238,23 @@ public class DatabaseService {
             for (JsonElement postElement : posts) {
                 JsonObject post = postElement.getAsJsonObject();
 
-                pstmt.setString(1, post.get("id").getAsString() + "_" + keyword);
-                pstmt.setString(2, post.has("title") ? post.get("title").getAsString() : null);
-                pstmt.setString(3, post.has("text") ? post.get("text").getAsString() : null);
-                
+                String title = post.has("title") ? post.get("title").getAsString() : null;
+                String body = post.has("text") ? post.get("text").getAsString() : null;
+                String matchText = ((title == null ? "" : title) + " " + (body == null ? "" : body)).trim();
+
+                pstmt.setString(1, post.get("id").getAsString() + "_" + entity);
+                pstmt.setString(2, title);
+                pstmt.setString(3, body);
+
                 long createdUtc = post.get("created_utc").getAsLong();
                 pstmt.setTimestamp(4, Timestamp.from(Instant.ofEpochSecond(createdUtc)));
-                pstmt.setString(5, keyword);
-                pstmt.setString(6, category);
-                pstmt.setString(7, post.has("permalink") ? post.get("permalink").getAsString() : null);
-                pstmt.setString(8, post.has("author") ? post.get("author").getAsString() : null);
-                pstmt.setInt(9, post.has("score") ? post.get("score").getAsInt() : 0);
-                pstmt.setInt(10, post.has("num_comments") ? post.get("num_comments").getAsInt() : 0);
+                pstmt.setString(5, entity);
+                pstmt.setString(6, matchedKeywords(matchText.isEmpty() ? null : matchText, entity, keywords));
+                pstmt.setString(7, category);
+                pstmt.setString(8, post.has("permalink") ? post.get("permalink").getAsString() : null);
+                pstmt.setString(9, post.has("author") ? post.get("author").getAsString() : null);
+                pstmt.setInt(10, post.has("score") ? post.get("score").getAsInt() : 0);
+                pstmt.setInt(11, post.has("num_comments") ? post.get("num_comments").getAsInt() : 0);
 
                 pstmt.addBatch();
             }
@@ -244,11 +299,13 @@ public class DatabaseService {
         }
     }
 
-    public static String getLastXPostId(String keyword) {
+    // since_id is tracked per entity now (one OR'd search per entity). The x_post_ids.keyword
+    // column stores the entity value.
+    public static String getLastXPostId(String entity) {
         String sql = "SELECT post_id FROM x_post_ids WHERE keyword = ?";
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, keyword);
+            pstmt.setString(1, entity);
             try (ResultSet rs = pstmt.executeQuery()) {
                 if (rs.next()) {
                     return rs.getString("post_id");
@@ -262,21 +319,23 @@ public class DatabaseService {
     }
 
     public static void upsertEntityKeyword(JsonObject inputQuery) {
+//        String entity = inputQuery.get("entity").getAsString();
 //        String keyword = inputQuery.get("keyword").getAsString();
 //        String category = inputQuery.has("category") ? inputQuery.get("category").getAsString() : null;
 //        String language = inputQuery.has("language") ? inputQuery.get("language").getAsString() : null;
 //        String state = inputQuery.has("state") ? inputQuery.get("state").getAsString() : null;
 //        String industry = inputQuery.has("industry") ? inputQuery.get("industry").getAsString() : null;
 //
-//        String sql = "INSERT INTO entity_keywords (keyword, category, language, state, industry) VALUES (?, ?, ?, ?, ?) " +
-//                "ON CONFLICT (keyword) DO UPDATE SET category = EXCLUDED.category, language = EXCLUDED.language, state = EXCLUDED.state, industry = EXCLUDED.industry";
+//        String sql = "INSERT INTO entity_keywords (entity, keyword, category, language, state, industry) VALUES (?, ?, ?, ?, ?, ?) " +
+//                "ON CONFLICT (keyword) DO UPDATE SET entity = EXCLUDED.entity, category = EXCLUDED.category, language = EXCLUDED.language, state = EXCLUDED.state, industry = EXCLUDED.industry";
 //        try (Connection conn = getConnection();
 //             PreparedStatement pstmt = conn.prepareStatement(sql)) {
-//            pstmt.setString(1, keyword);
-//            pstmt.setString(2, category);
-//            pstmt.setString(3, language);
-//            pstmt.setString(4, state);
-//            pstmt.setString(5, industry);
+//            pstmt.setString(1, entity);
+//            pstmt.setString(2, keyword);
+//            pstmt.setString(3, category);
+//            pstmt.setString(4, language);
+//            pstmt.setString(5, state);
+//            pstmt.setString(6, industry);
 //            pstmt.executeUpdate();
 //        } catch (SQLException e) {
 //            System.err.println("Database error upserting entity_keyword '" + keyword + "': " + e.getMessage());
@@ -370,11 +429,11 @@ public class DatabaseService {
         }
     }
 
-    public static void saveLastXPostId(String keyword, String newestId) {
+    public static void saveLastXPostId(String entity, String newestId) {
         String sql = "INSERT INTO x_post_ids (keyword, post_id) VALUES (?, ?) ON CONFLICT (keyword) DO UPDATE SET post_id = ?";
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
-            pstmt.setString(1, keyword);
+            pstmt.setString(1, entity);
             pstmt.setString(2, newestId);
             pstmt.setString(3, newestId);
             pstmt.executeUpdate();

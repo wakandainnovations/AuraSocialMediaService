@@ -15,8 +15,12 @@ import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
@@ -66,22 +70,35 @@ public class YouTubeMain implements SocialMediaScanner {
         return inputQueries;
     }
 
-    public static void search(String query, String category) throws Exception {
-        System.out.println("\nRetrieving latest " + numberOfVideos + " videos for '" + query + "'...");
+    /**
+     * Searches YouTube for a single entity. The entity's keywords are combined into one OR'd video
+     * search (e.g. "GDN|GDNaidu"), so a video matching several keywords is found once and its comments
+     * are fetched (and stored) once instead of once per keyword. Comments are deduped per entity via
+     * the composite id commentId_entity in saveYouTubeComments(...).
+     */
+    public static void search(String entity, List<String> keywords, String category) throws Exception {
+        String combinedQuery = buildQuery(keywords);
+        System.out.println("\nRetrieving latest " + numberOfVideos + " videos for entity '" + entity
+                + "' (keywords: " + String.join(", ", keywords) + ")...");
 
         YouTubeService service = new YouTubeService("YouTubeSearchApp", API_KEY);
-        List<SearchResult> videos = service.searchVideos(query, numberOfVideos);
+        List<SearchResult> videos = service.searchVideos(combinedQuery, numberOfVideos);
 
         if (videos.isEmpty()) {
-            System.out.println("No videos found for the query: '" + query + "'");
+            System.out.println("No videos found for entity: '" + entity + "'");
             return;
         }
 
         System.out.println("Search successful. Found " + videos.size() + " videos.");
         JsonArray videoComments = new JsonArray();
+        // Guard against the same video appearing more than once so we fetch its comments only once.
+        Set<String> seenVideoIds = new HashSet<>();
 
         for (SearchResult video : videos) {
             String videoId = video.getId().getVideoId();
+            if (!seenVideoIds.add(videoId)) {
+                continue;
+            }
             System.out.println("\nFetching " + numberOfComments + " comments for video: " + video.getSnippet().getTitle() + " (ID: " + videoId + ")");
 
             // *******************************************
@@ -116,8 +133,13 @@ public class YouTubeMain implements SocialMediaScanner {
         }
 
         if (videoComments.size() > 0) {
-            DatabaseService.saveYouTubeComments(videoComments, query, category);
+            DatabaseService.saveYouTubeComments(videoComments, entity, keywords, category);
         }
+    }
+
+    // Builds the OR'd video-search query for a set of keywords. YouTube's `q` uses '|' for OR.
+    private static String buildQuery(List<String> keywords) {
+        return keywords.size() == 1 ? keywords.get(0) : String.join("|", keywords);
     }
 
     @Override
@@ -127,27 +149,40 @@ public class YouTubeMain implements SocialMediaScanner {
             System.out.println("Initializing YouTube Search...");
             List<JsonObject> inputQueries = loadInputQueries();
 
+            // Group keyword lines by entity and poll once per entity (not per keyword), combining its
+            // keywords into one OR'd video search so a shared video's comments are read/stored once.
+            Map<String, List<JsonObject>> queriesByEntity = new LinkedHashMap<>();
             for (JsonObject inputQuery : inputQueries) {
-                String keyword = inputQuery.get("keyword").getAsString();
-                String category = inputQuery.get("category").getAsString();
+                String entity = inputQuery.get("entity").getAsString();
+                queriesByEntity.computeIfAbsent(entity, k -> new ArrayList<>()).add(inputQuery);
                 DatabaseService.upsertEntityKeyword(inputQuery);
-                // SME Recommendation: Randomize initial delay so keywords don't all hit the API at once
+            }
+
+            for (Map.Entry<String, List<JsonObject>> entry : queriesByEntity.entrySet()) {
+                String entity = entry.getKey();
+                List<JsonObject> queries = entry.getValue();
+                List<String> keywords = queries.stream()
+                        .map(q -> q.get("keyword").getAsString())
+                        .collect(Collectors.toList());
+                // Keyword lines of one entity share its category.
+                String category = queries.get(0).get("category").getAsString();
+                // SME Recommendation: Randomize initial delay so entities don't all hit the API at once
                 long initialDelay = ThreadLocalRandom.current().nextLong(0, 60);
-                System.out.println("\nProcessing keyword: " + keyword);
+                System.out.println("\nProcessing entity: " + entity + " -> keywords " + keywords);
                 // Schedule the task to run every 1 hour (3600 seconds)
                 scheduler.scheduleAtFixedRate(() -> {
                     try {
-                        System.out.println("\n[Scheduled Task] Starting: " + keyword);
-                        search(keyword, category);
+                        System.out.println("\n[Scheduled Task] Starting: " + entity);
+                        search(entity, keywords, category);
                     } catch (GoogleJsonResponseException e) {
                         if (e.getDetails() != null && e.getDetails().getCode() == 403 && e.getDetails().getMessage().contains("quota")) {
                             System.err.println("YouTube API quota exceeded. Shutting down all tasks.");
                             scheduler.shutdown();
                         } else {
-                            System.err.println("Google API error for " + keyword + ": " + e.getMessage());
+                            System.err.println("Google API error for " + entity + ": " + e.getMessage());
                         }
                     } catch (Exception e) {
-                        System.err.println("Error in scheduled task for " + keyword + ": " + e.getMessage());
+                        System.err.println("Error in scheduled task for " + entity + ": " + e.getMessage());
                     }
                 }, initialDelay, 3600, TimeUnit.SECONDS);            }
 

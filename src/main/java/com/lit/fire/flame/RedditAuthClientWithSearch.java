@@ -19,9 +19,14 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Collectors;
 
 /**
  * A client for authenticating with the Reddit API using the OAuth 2.0
@@ -167,42 +172,69 @@ public class RedditAuthClientWithSearch implements SocialMediaScanner {
         return posts;
     }
 
+    private static List<JsonObject> loadInputQueries() throws IOException {
+        List<JsonObject> inputQueries = new ArrayList<>();
+        try (InputStream input = RedditAuthClientWithSearch.class.getClassLoader().getResourceAsStream("search_queries.txt")) {
+            if (input == null) {
+                System.err.println("Resource not found: search_queries.txt");
+                return inputQueries;
+            }
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (!line.trim().isEmpty()) {
+                        inputQueries.add(JsonParser.parseString(line).getAsJsonObject());
+                    }
+                }
+            }
+        }
+        return inputQueries;
+    }
+
+    // Builds the OR'd Reddit search query for a set of keywords (e.g. "(GDN OR GDNaidu)").
+    private static String buildQuery(List<String> keywords) {
+        return keywords.size() == 1 ? keywords.get(0) : "(" + String.join(" OR ", keywords) + ")";
+    }
+
     @Override
     public void scan() {
-        String resourceName = "search_queries.txt";
-
         try {
             String accessToken = getAccessToken();
             System.out.println("Successfully retrieved Reddit API Access Token.");
 
-            try (InputStream is = RedditAuthClientWithSearch.class.getClassLoader().getResourceAsStream(resourceName)) {
-                if (is == null) {
-                    System.err.println("Resource not found: " + resourceName);
-                    return;
-                }
-                try (BufferedReader br = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
-                    String line;
+            List<JsonObject> inputQueries = loadInputQueries();
 
-                    while ((line = br.readLine()) != null) {
-                        JsonObject searchQuery = JsonParser.parseString(line).getAsJsonObject();
-                        String keyword = searchQuery.get("keyword").getAsString();
-                        String category = searchQuery.get("category").getAsString();
+            // Group keyword lines by entity and search once per entity with one OR'd query, so a post
+            // matching several of the entity's keywords is read once and stored once (composite id
+            // postId_entity in saveRedditPosts(...)).
+            Map<String, List<JsonObject>> queriesByEntity = new LinkedHashMap<>();
+            for (JsonObject inputQuery : inputQueries) {
+                String entity = inputQuery.get("entity").getAsString();
+                queriesByEntity.computeIfAbsent(entity, k -> new ArrayList<>()).add(inputQuery);
+                DatabaseService.upsertEntityKeyword(inputQuery);
+            }
 
-                        if (!keyword.isEmpty()) {
-                            DatabaseService.upsertEntityKeyword(searchQuery);
-                            System.out.println("Searching for: " + keyword);
-                            JsonArray posts = searchPosts(accessToken, keyword);
-                            if (posts.size() > 0) {
-                                DatabaseService.saveRedditPosts(posts, keyword, category);
-                            }
-                            long delay = ThreadLocalRandom.current().nextLong(300000, 600001);
-                            System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next keyword...");
-                            Thread.sleep(delay);
-                        }
-                    }
+            for (Map.Entry<String, List<JsonObject>> entry : queriesByEntity.entrySet()) {
+                String entity = entry.getKey();
+                List<JsonObject> queries = entry.getValue();
+                List<String> keywords = queries.stream()
+                        .map(q -> q.get("keyword").getAsString())
+                        .filter(k -> !k.isEmpty())
+                        .collect(Collectors.toList());
+                if (keywords.isEmpty()) {
+                    continue;
                 }
-            } catch (IOException e) {
-                System.err.println("Error reading the file: " + e.getMessage());
+                // Keyword lines of one entity share its category.
+                String category = queries.get(0).get("category").getAsString();
+                String orQuery = buildQuery(keywords);
+                System.out.println("Searching for entity: " + entity + " -> " + orQuery);
+                JsonArray posts = searchPosts(accessToken, orQuery);
+                if (posts.size() > 0) {
+                    DatabaseService.saveRedditPosts(posts, entity, keywords, category);
+                }
+                long delay = ThreadLocalRandom.current().nextLong(300000, 600001);
+                System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next entity...");
+                Thread.sleep(delay);
             }
 
         } catch (Exception e) {

@@ -1,10 +1,8 @@
-{"keyword": "Karuppu", "category": "media.movie", "language": "tamil"}
-{"keyword": "DMK", "category": "politics.party", "state": "Tamil Nadu"}
-{"keyword": "ADMK", "category": "politics.party", "state": "Tamil Nadu"}
-{"keyword": "TVK", "category": "politics.party", "state": "Tamil Nadu"}
-{"keyword": "BJP", "category": "politics.party", "state": "All"}
-{"keyword": "Suriya", "category": "media.celebrity", "industry": "Kollywood"}
-{"keyword": "Athiradi", "category": "media.movie", "language": "malayalam"}
-{"keyword": "Gaanja Shankar", "category": "media.movie", "language": "telugu"}
-{"keyword": "Naa Naa", "category": "media.movie", "language": "tamil"}
-{"keyword": "Sai Dharam Tej", "category": "media.celebrity", "industry": "Tollywood"}
+{"entity": "GDN", "keyword": "GDN", "category": "media.movie", "language": "tamil"}
+{"entity": "GDN", "keyword": "GDNaidu", "category": "media.movie", "language": "tamil"}
+{"entity": "Kaalaghatta", "keyword": "Kaalaghatta", "category": "media.movie", "language": "kannada"}
+{"entity": "NooruSaami", "keyword": "NooruSaami", "category": "media.movie", "language": "tamil"}
+{"entity": "LakshmikanthanKolaiVazhakku", "keyword": "LakshmikanthanKolaiVazhakku", "category": "media.movie", "language": "tamil"}
+{"entity": "Dodmansa", "keyword": "Dodmansa", "category": "media.movie", "language": "kannada"}
+{"entity": "BalanTheBoy", "keyword": "BalanTheBoy", "category": "media.movie", "language": "kannada"}
+{"entity": "Urabba", "keyword": "Urabba", "category": "media.movie", "language": "kannada"}
