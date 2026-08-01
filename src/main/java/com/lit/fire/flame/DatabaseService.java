@@ -112,7 +112,9 @@ public class DatabaseService {
     public static void saveInstagramPosts(JsonArray posts, String entity, List<String> keywords, String category) throws Exception {
         String sql = "INSERT INTO instagram_posts (id, text, media_type, media_url, permalink, timestamp, entity, keyword, sentiment_category, author, like_count, comments_count, " +
                 "shortcode, product_type, author_id, author_full_name, author_is_verified, author_follower_count, video_url, duration_seconds, hashtags, mentions, is_paid_partnership, play_count, reshare_count, location_name) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+                "ON CONFLICT (id) DO UPDATE SET like_count = EXCLUDED.like_count, comments_count = EXCLUDED.comments_count, " +
+                "play_count = EXCLUDED.play_count, reshare_count = EXCLUDED.reshare_count";
 
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -287,7 +289,9 @@ public class DatabaseService {
     public static void saveRedditPosts(JsonArray posts, String entity, List<String> keywords, String category) throws Exception {
         String sql = "INSERT INTO reddit_posts (id, title, text, created_at, entity, keyword, sentiment_category, permalink, author, score, num_comments, " +
                 "flair, post_type, community_name, subreddit_subscribers, upvote_ratio, nsfw, spoiler, locked, stickied, total_awards_received, gilded, domain, word_count, author_flair_text) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+                "ON CONFLICT (id) DO UPDATE SET score = EXCLUDED.score, num_comments = EXCLUDED.num_comments, " +
+                "upvote_ratio = EXCLUDED.upvote_ratio, total_awards_received = EXCLUDED.total_awards_received, gilded = EXCLUDED.gilded";
 
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
