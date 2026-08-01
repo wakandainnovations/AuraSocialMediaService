@@ -282,6 +282,54 @@ public class DatabaseService {
         }
     }
 
+    // Videos are keyed/deduped per entity: the composite id is videoId_entity, so a video matching
+    // several of the entity's keywords is stored once. The `keyword` column records which of the
+    // entity's keywords appear in the title (comma-joined), falling back to entity. Unlike comments,
+    // view/like/comment counts keep changing after a video is first seen, so re-scans refresh them
+    // via ON CONFLICT DO UPDATE instead of being skipped.
+    public static void saveYouTubeVideos(JsonArray videos, String entity, List<String> keywords, String category) throws Exception {
+        String sql = "INSERT INTO youtube_videos (id, video_id, title, channel_title, published_at, permalink, entity, keyword, sentiment_category, view_count, like_count, comment_count) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+                "ON CONFLICT (id) DO UPDATE SET view_count = EXCLUDED.view_count, like_count = EXCLUDED.like_count, " +
+                "comment_count = EXCLUDED.comment_count, last_refreshed_at = NOW()";
+
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+
+            for (JsonElement videoElement : videos) {
+                JsonObject video = videoElement.getAsJsonObject();
+
+                String videoId = video.get("id").getAsString();
+                String title = video.has("title") ? video.get("title").getAsString() : null;
+
+                pstmt.setString(1, videoId + "_" + entity);
+                pstmt.setString(2, videoId);
+                pstmt.setString(3, title);
+                pstmt.setString(4, video.has("channel_title") ? video.get("channel_title").getAsString() : null);
+
+                String timestampString = video.get("published_at").getAsString();
+                Instant instant = Instant.parse(timestampString);
+                pstmt.setTimestamp(5, Timestamp.from(instant));
+                pstmt.setString(6, video.get("permalink").getAsString());
+                pstmt.setString(7, entity);
+                pstmt.setString(8, matchedKeywords(title, entity, keywords));
+                pstmt.setString(9, category);
+                pstmt.setLong(10, video.has("view_count") ? video.get("view_count").getAsLong() : 0L);
+                pstmt.setLong(11, video.has("like_count") ? video.get("like_count").getAsLong() : 0L);
+                pstmt.setLong(12, video.has("comment_count") ? video.get("comment_count").getAsLong() : 0L);
+
+                pstmt.addBatch();
+            }
+
+            pstmt.executeBatch();
+            System.out.println("Successfully saved/refreshed " + videos.size() + " YouTube videos to the database.");
+
+        } catch (SQLException e) {
+            System.err.println("Database error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
     // Posts are keyed/deduped per entity: the composite id is postId_entity, so a post matching
     // several of the entity's keywords (one OR'd search) is stored once. The `keyword` column records
     // which of the entity's keywords appear in the title/body (comma-joined), falling back to entity.

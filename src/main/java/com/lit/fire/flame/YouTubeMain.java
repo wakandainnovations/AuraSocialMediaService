@@ -4,6 +4,8 @@ import com.google.api.client.googleapis.json.GoogleJsonResponseException;
 import com.google.api.services.youtube.model.CommentSnippet;
 import com.google.api.services.youtube.model.CommentThread;
 import com.google.api.services.youtube.model.SearchResult;
+import com.google.api.services.youtube.model.Video;
+import com.google.api.services.youtube.model.VideoStatistics;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
@@ -93,12 +95,15 @@ public class YouTubeMain implements SocialMediaScanner {
         JsonArray videoComments = new JsonArray();
         // Guard against the same video appearing more than once so we fetch its comments only once.
         Set<String> seenVideoIds = new HashSet<>();
+        // Keeps first-seen order/snippet for the like/view/comment-count upsert below.
+        Map<String, SearchResult> uniqueVideos = new LinkedHashMap<>();
 
         for (SearchResult video : videos) {
             String videoId = video.getId().getVideoId();
             if (!seenVideoIds.add(videoId)) {
                 continue;
             }
+            uniqueVideos.put(videoId, video);
             System.out.println("\nFetching " + numberOfComments + " comments for video: " + video.getSnippet().getTitle() + " (ID: " + videoId + ")");
 
             // *******************************************
@@ -134,6 +139,35 @@ public class YouTubeMain implements SocialMediaScanner {
 
         if (videoComments.size() > 0) {
             DatabaseService.saveYouTubeComments(videoComments, entity, keywords, category);
+        }
+
+        if (!uniqueVideos.isEmpty()) {
+            Map<String, Video> statsByVideoId = service.getVideoStatistics(new ArrayList<>(uniqueVideos.keySet()));
+            JsonArray videoDocs = new JsonArray();
+
+            for (Map.Entry<String, SearchResult> entry : uniqueVideos.entrySet()) {
+                String videoId = entry.getKey();
+                SearchResult video = entry.getValue();
+
+                JsonObject videoJson = new JsonObject();
+                videoJson.addProperty("id", videoId);
+                videoJson.addProperty("title", video.getSnippet().getTitle());
+                videoJson.addProperty("channel_title", video.getSnippet().getChannelTitle());
+                videoJson.addProperty("published_at", video.getSnippet().getPublishedAt().toString());
+                videoJson.addProperty("permalink", "https://www.youtube.com/watch?v=" + videoId);
+
+                Video stats = statsByVideoId.get(videoId);
+                VideoStatistics statistics = stats != null ? stats.getStatistics() : null;
+                if (statistics != null) {
+                    videoJson.addProperty("view_count", statistics.getViewCount() != null ? statistics.getViewCount().longValue() : 0L);
+                    // Creators can hide like counts, so a null here is a real "unknown", not a zero.
+                    videoJson.addProperty("like_count", statistics.getLikeCount() != null ? statistics.getLikeCount().longValue() : 0L);
+                    videoJson.addProperty("comment_count", statistics.getCommentCount() != null ? statistics.getCommentCount().longValue() : 0L);
+                }
+                videoDocs.add(videoJson);
+            }
+
+            DatabaseService.saveYouTubeVideos(videoDocs, entity, keywords, category);
         }
     }
 

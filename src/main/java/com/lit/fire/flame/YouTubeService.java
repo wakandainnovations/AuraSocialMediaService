@@ -10,11 +10,15 @@ import com.google.api.services.youtube.model.CommentThread;
 import com.google.api.services.youtube.model.CommentThreadListResponse;
 import com.google.api.services.youtube.model.SearchListResponse;
 import com.google.api.services.youtube.model.SearchResult;
+import com.google.api.services.youtube.model.Video;
+import com.google.api.services.youtube.model.VideoListResponse;
 
 import java.io.IOException;
 import java.security.GeneralSecurityException;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
@@ -164,5 +168,43 @@ public class YouTubeService {
         }
 
         return Collections.emptyList();
+    }
+
+    /**
+     * Fetches view/like/comment statistics for a batch of videos in a single call (the Data API
+     * accepts up to 50 comma-separated ids per videos().list request).
+     *
+     * @param videoIds The video ids to fetch statistics for.
+     * @return A map of video id -> Video (with snippet + statistics populated), missing an entry
+     *         for any id YouTube no longer returns (e.g. deleted/private videos).
+     */
+    public Map<String, Video> getVideoStatistics(List<String> videoIds) {
+        Map<String, Video> statsByVideoId = new HashMap<>();
+        if (videoIds == null || videoIds.isEmpty()) {
+            return statsByVideoId;
+        }
+
+        try {
+            YouTube.Videos.List request = youtubeService.videos().list("snippet,statistics");
+            request.setKey(apiKey);
+            request.setId(String.join(",", videoIds));
+            request.setFields("items(id,snippet/title,snippet/channelTitle,snippet/publishedAt," +
+                    "statistics/viewCount,statistics/likeCount,statistics/commentCount)");
+
+            VideoListResponse response = request.execute();
+            List<Video> items = response.getItems();
+            if (items != null) {
+                for (Video video : items) {
+                    statsByVideoId.put(video.getId(), video);
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("An IO error occurred while fetching video statistics: " + e.getMessage());
+        } catch (Exception e) {
+            System.err.println("An unexpected error occurred while fetching video statistics: " + e.getMessage());
+            e.printStackTrace();
+        }
+
+        return statsByVideoId;
     }
 }
