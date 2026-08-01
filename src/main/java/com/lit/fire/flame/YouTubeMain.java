@@ -169,7 +169,7 @@ public class YouTubeMain implements SocialMediaScanner {
                 // SME Recommendation: Randomize initial delay so entities don't all hit the API at once
                 long initialDelay = ThreadLocalRandom.current().nextLong(0, 60);
                 System.out.println("\nProcessing entity: " + entity + " -> keywords " + keywords);
-                // Schedule the task to run every 1 hour (3600 seconds)
+                // Schedule the task to run every 4 hours (14400 seconds)
                 scheduler.scheduleAtFixedRate(() -> {
                     try {
                         System.out.println("\n[Scheduled Task] Starting: " + entity);
@@ -184,7 +184,7 @@ public class YouTubeMain implements SocialMediaScanner {
                     } catch (Exception e) {
                         System.err.println("Error in scheduled task for " + entity + ": " + e.getMessage());
                     }
-                }, initialDelay, 3600, TimeUnit.SECONDS);            }
+                }, initialDelay, 14400, TimeUnit.SECONDS);            }
 
         } catch (Exception e) {
             System.err.println("An unrecoverable error occurred during the process.");

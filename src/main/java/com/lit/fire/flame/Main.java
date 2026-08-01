@@ -45,13 +45,20 @@ public class Main {
 
     public static void main(String[] args) {
         List<ScannableService> services = new ArrayList<>();
-//        services.add(new ScannableService(new InstagramService(), "Instagram"));
-//        services.add(new ScannableService(new RedditAuthClientWithSearch(), "Reddit"));
+        // Instagram/Reddit are collected via Apify Actors (InstagramApifyService/RedditApifyService),
+        // not the native Graph API / Reddit OAuth clients (InstagramService/RedditAuthClientWithSearch).
+        services.add(new ScannableService(new InstagramApifyService(), "Instagram"));
+        services.add(new ScannableService(new RedditApifyService(), "Reddit"));
         services.add(new ScannableService(new XService(), "X"));
         services.add(new ScannableService(new YouTubeMain(), "YouTube"));
 
         for (ScannableService service : services) {
             new Thread(service).start();
         }
+
+        // One-time historical backfill (past year, Instagram + Reddit) for MOVIE entities in
+        // Tamil/Kannada. Runs in its own thread, separate from the recurring scans above, and
+        // exits when done rather than re-scheduling itself.
+        new Thread(new HistoricalBackfillService(), "HistoricalBackfill").start();
     }
 }

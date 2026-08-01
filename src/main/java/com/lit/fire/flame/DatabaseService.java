@@ -10,6 +10,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
+import java.sql.Types;
 import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -69,11 +70,49 @@ public class DatabaseService {
         return matched.isEmpty() ? entity : matched;
     }
 
+    // Nullable setters for source-specific columns (e.g. Apify-only fields) that native scanners'
+    // post objects never populate. Missing/null JSON keys become a real SQL NULL rather than a
+    // synthetic 0/false, since "not provided by this source" and "confirmed zero/false" differ.
+    private static void setNullableString(PreparedStatement pstmt, int index, JsonObject obj, String key) throws SQLException {
+        if (obj.has(key) && !obj.get(key).isJsonNull()) {
+            pstmt.setString(index, obj.get(key).getAsString());
+        } else {
+            pstmt.setNull(index, Types.VARCHAR);
+        }
+    }
+
+    private static void setNullableInt(PreparedStatement pstmt, int index, JsonObject obj, String key) throws SQLException {
+        if (obj.has(key) && !obj.get(key).isJsonNull()) {
+            pstmt.setInt(index, obj.get(key).getAsInt());
+        } else {
+            pstmt.setNull(index, Types.INTEGER);
+        }
+    }
+
+    private static void setNullableDouble(PreparedStatement pstmt, int index, JsonObject obj, String key) throws SQLException {
+        if (obj.has(key) && !obj.get(key).isJsonNull()) {
+            pstmt.setDouble(index, obj.get(key).getAsDouble());
+        } else {
+            pstmt.setNull(index, Types.DOUBLE);
+        }
+    }
+
+    private static void setNullableBoolean(PreparedStatement pstmt, int index, JsonObject obj, String key) throws SQLException {
+        if (obj.has(key) && !obj.get(key).isJsonNull()) {
+            pstmt.setBoolean(index, obj.get(key).getAsBoolean());
+        } else {
+            pstmt.setNull(index, Types.BOOLEAN);
+        }
+    }
+
     // Posts are keyed/deduped per entity: the composite id is postId_entity, so a post tagged with
     // several of the entity's hashtags is stored once. The `keyword` column records which of the
     // entity's keywords actually appear in the caption (comma-joined), falling back to the entity.
+    // Columns after comments_count are Apify-sourced extras; native (Graph API) posts leave them NULL.
     public static void saveInstagramPosts(JsonArray posts, String entity, List<String> keywords, String category) throws Exception {
-        String sql = "INSERT INTO instagram_posts (id, text, media_type, media_url, permalink, timestamp, entity, keyword, sentiment_category, author, like_count, comments_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
+        String sql = "INSERT INTO instagram_posts (id, text, media_type, media_url, permalink, timestamp, entity, keyword, sentiment_category, author, like_count, comments_count, " +
+                "shortcode, product_type, author_id, author_full_name, author_is_verified, author_follower_count, video_url, duration_seconds, hashtags, mentions, is_paid_partnership, play_count, reshare_count, location_name) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
 
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -99,6 +138,21 @@ public class DatabaseService {
                 pstmt.setString(10, post.has("username") ? post.get("username").getAsString() : null);
                 pstmt.setInt(11, post.has("like_count") ? post.get("like_count").getAsInt() : 0);
                 pstmt.setInt(12, post.has("comments_count") ? post.get("comments_count").getAsInt() : 0);
+
+                setNullableString(pstmt, 13, post, "shortcode");
+                setNullableString(pstmt, 14, post, "product_type");
+                setNullableString(pstmt, 15, post, "author_id");
+                setNullableString(pstmt, 16, post, "author_full_name");
+                setNullableBoolean(pstmt, 17, post, "author_is_verified");
+                setNullableInt(pstmt, 18, post, "author_follower_count");
+                setNullableString(pstmt, 19, post, "video_url");
+                setNullableDouble(pstmt, 20, post, "duration_seconds");
+                setNullableString(pstmt, 21, post, "hashtags");
+                setNullableString(pstmt, 22, post, "mentions");
+                setNullableBoolean(pstmt, 23, post, "is_paid_partnership");
+                setNullableInt(pstmt, 24, post, "play_count");
+                setNullableInt(pstmt, 25, post, "reshare_count");
+                setNullableString(pstmt, 26, post, "location_name");
 
                 pstmt.addBatch();
             }
@@ -229,8 +283,11 @@ public class DatabaseService {
     // Posts are keyed/deduped per entity: the composite id is postId_entity, so a post matching
     // several of the entity's keywords (one OR'd search) is stored once. The `keyword` column records
     // which of the entity's keywords appear in the title/body (comma-joined), falling back to entity.
+    // Columns after num_comments are Apify-sourced extras; native (OAuth search) posts leave them NULL.
     public static void saveRedditPosts(JsonArray posts, String entity, List<String> keywords, String category) throws Exception {
-        String sql = "INSERT INTO reddit_posts (id, title, text, created_at, entity, keyword, sentiment_category, permalink, author, score, num_comments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
+        String sql = "INSERT INTO reddit_posts (id, title, text, created_at, entity, keyword, sentiment_category, permalink, author, score, num_comments, " +
+                "flair, post_type, community_name, subreddit_subscribers, upvote_ratio, nsfw, spoiler, locked, stickied, total_awards_received, gilded, domain, word_count, author_flair_text) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
 
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -255,6 +312,21 @@ public class DatabaseService {
                 pstmt.setString(9, post.has("author") ? post.get("author").getAsString() : null);
                 pstmt.setInt(10, post.has("score") ? post.get("score").getAsInt() : 0);
                 pstmt.setInt(11, post.has("num_comments") ? post.get("num_comments").getAsInt() : 0);
+
+                setNullableString(pstmt, 12, post, "flair");
+                setNullableString(pstmt, 13, post, "post_type");
+                setNullableString(pstmt, 14, post, "community_name");
+                setNullableInt(pstmt, 15, post, "subreddit_subscribers");
+                setNullableDouble(pstmt, 16, post, "upvote_ratio");
+                setNullableBoolean(pstmt, 17, post, "nsfw");
+                setNullableBoolean(pstmt, 18, post, "spoiler");
+                setNullableBoolean(pstmt, 19, post, "locked");
+                setNullableBoolean(pstmt, 20, post, "stickied");
+                setNullableInt(pstmt, 21, post, "total_awards_received");
+                setNullableInt(pstmt, 22, post, "gilded");
+                setNullableString(pstmt, 23, post, "domain");
+                setNullableInt(pstmt, 24, post, "word_count");
+                setNullableString(pstmt, 25, post, "author_flair_text");
 
                 pstmt.addBatch();
             }
@@ -341,6 +413,47 @@ public class DatabaseService {
 //            System.err.println("Database error upserting entity_keyword '" + keyword + "': " + e.getMessage());
 //            e.printStackTrace();
 //        }
+    }
+
+    // Backs the historical backfill (HistoricalBackfillService): pulls every keyword owned by a
+    // managed_entities row of the given type whose language is (case-insensitively) one of
+    // `languages`, joined through entity_keywords.entity_id. Rows with a null/blank keyword are
+    // skipped since they can't drive a hashtag/search query. Shaped like the search_queries.txt
+    // JsonObjects (entity/keyword/category) so callers can group-by-entity the same way the
+    // *ApifyService scanners do.
+    public static List<JsonObject> getManagedEntityKeywords(String type, List<String> languages) {
+        List<JsonObject> result = new ArrayList<>();
+        if (languages == null || languages.isEmpty()) {
+            return result;
+        }
+        String sql = "SELECT me.name AS entity, ek.keyword, ek.category " +
+                "FROM managed_entities me " +
+                "JOIN entity_keywords ek ON ek.entity_id = me.id " +
+                "WHERE me.type = ? AND ek.keyword IS NOT NULL AND trim(ek.keyword) <> '' " +
+                "AND LOWER(me.language) = ANY (?)";
+
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, type);
+            String[] lowerLanguages = languages.stream()
+                    .map(String::toLowerCase)
+                    .toArray(String[]::new);
+            pstmt.setArray(2, conn.createArrayOf("text", lowerLanguages));
+
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    JsonObject row = new JsonObject();
+                    row.addProperty("entity", rs.getString("entity"));
+                    row.addProperty("keyword", rs.getString("keyword"));
+                    row.addProperty("category", rs.getString("category"));
+                    result.add(row);
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Database error in getManagedEntityKeywords: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return result;
     }
 
     /**
