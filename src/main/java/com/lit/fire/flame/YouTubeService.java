@@ -74,7 +74,7 @@ public class YouTubeService {
 
             // Set the 'fields' parameter to optimize the response by requesting only the needed data.
             // This reduces payload size and processing time.
-            searchRequest.setFields("items(id/videoId,snippet/title,snippet/thumbnails/default/url)");
+            searchRequest.setFields("items(id/videoId,snippet/title,snippet/channelTitle,snippet/publishedAt,snippet/thumbnails/default/url)");
 
             long delay = ThreadLocalRandom.current().nextLong(300000, 600001);
             System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next keyword...");

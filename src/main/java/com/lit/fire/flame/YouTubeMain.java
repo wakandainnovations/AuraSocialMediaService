@@ -149,6 +149,11 @@ public class YouTubeMain implements SocialMediaScanner {
                 String videoId = entry.getKey();
                 SearchResult video = entry.getValue();
 
+                if (video.getSnippet().getPublishedAt() == null) {
+                    System.err.println("Skipping video stats for " + videoId + ": API returned no publishedAt.");
+                    continue;
+                }
+
                 JsonObject videoJson = new JsonObject();
                 videoJson.addProperty("id", videoId);
                 videoJson.addProperty("title", video.getSnippet().getTitle());
