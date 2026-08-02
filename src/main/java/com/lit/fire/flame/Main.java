@@ -55,10 +55,5 @@ public class Main {
         for (ScannableService service : services) {
             new Thread(service).start();
         }
-
-        // One-time historical backfill (past year, Instagram + Reddit) for MOVIE entities in
-        // Tamil/Kannada. Runs in its own thread, separate from the recurring scans above, and
-        // exits when done rather than re-scheduling itself.
-        new Thread(new HistoricalBackfillService(), "HistoricalBackfill").start();
     }
 }
