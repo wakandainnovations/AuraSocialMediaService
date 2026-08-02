@@ -19,7 +19,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 /**
@@ -32,6 +31,11 @@ public class InstagramApifyService implements SocialMediaScanner {
     private static final String ACTOR_ID = "apify/instagram-hashtag-scraper";
     // Matches the format DatabaseService.saveInstagramPosts(...) parses its "timestamp" field with.
     private static final DateTimeFormatter TIMESTAMP_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssZ");
+    // Platform key used for DatabaseService.getLastFetchTime/updateLastFetchTime(...)'s per-entity
+    // fetch cursor.
+    private static final String PLATFORM = "instagram";
+    // Fixed delay between consecutive Apify calls (one per entity), so calls aren't back-to-back.
+    private static final long ENTITY_DELAY_MS = 60 * 60 * 1000; // 1 hour
 
     private static int numberOfPosts;
 
@@ -294,10 +298,19 @@ public class InstagramApifyService implements SocialMediaScanner {
                         .collect(Collectors.toList());
                 String category = queries.get(0).get("category").getAsString();
                 System.out.println("\n[Apify/Instagram] Processing entity: " + entity + " -> keywords " + keywords);
-                search(entity, keywords, category);
-                long delay = ThreadLocalRandom.current().nextLong(300000, 600001);
-                System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next entity...");
-                Thread.sleep(delay);
+
+                // This Actor has no server-side date filter (unlike Reddit's), so it always returns
+                // up to numberOfPosts items regardless of what's new - the notOlderThan filter below
+                // only avoids re-saving posts already stored under this entity's last fetch, it does
+                // not reduce what's billed for the call itself. Frequency (see Main.APIFY_SUCCESS_DELAY_MS)
+                // is the actual cost lever for this scanner.
+                Instant lastFetch = DatabaseService.getLastFetchTime(PLATFORM, entity);
+                Instant scanStart = Instant.now();
+                search(entity, keywords, category, numberOfPosts, lastFetch);
+                DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
+
+                System.out.println(System.currentTimeMillis() + ": Waiting 60 minutes before the next entity...");
+                Thread.sleep(ENTITY_DELAY_MS);
             }
         } catch (Exception e) {
             System.err.println("An unrecoverable error occurred during the Instagram Apify scan.");

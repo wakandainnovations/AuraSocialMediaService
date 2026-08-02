@@ -423,6 +423,44 @@ public class DatabaseService {
         }
     }
 
+    // Per (platform, entity) cursor of the last successful Apify fetch, so InstagramApifyService/
+    // RedditApifyService can ask for only content newer than what was already fetched instead of
+    // re-paying to re-scrape the same window every scan cycle. Returns null on first fetch.
+    public static Instant getLastFetchTime(String platform, String entity) {
+        String sql = "SELECT last_fetched_at FROM apify_fetch_cursor WHERE platform = ? AND entity = ?";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, platform);
+            pstmt.setString(2, entity);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    Timestamp ts = rs.getTimestamp("last_fetched_at");
+                    return ts != null ? ts.toInstant() : null;
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Database error: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    public static void updateLastFetchTime(String platform, String entity, Instant fetchedAt) {
+        String sql = "INSERT INTO apify_fetch_cursor (platform, entity, last_fetched_at) VALUES (?, ?, ?) " +
+                "ON CONFLICT (platform, entity) DO UPDATE SET last_fetched_at = ?";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, platform);
+            pstmt.setString(2, entity);
+            pstmt.setTimestamp(3, Timestamp.from(fetchedAt));
+            pstmt.setTimestamp(4, Timestamp.from(fetchedAt));
+            pstmt.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Database error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
     // since_id is tracked per entity now (one OR'd search per entity). The x_post_ids.keyword
     // column stores the entity value.
     public static String getLastXPostId(String entity) {

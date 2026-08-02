@@ -10,11 +10,13 @@ import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.stream.Collectors;
 
 /**
@@ -29,6 +31,11 @@ import java.util.stream.Collectors;
 public class RedditApifyService implements SocialMediaScanner {
 
     private static final String ACTOR_ID = "fatihtahta/reddit-scraper-search-fast";
+    // Platform key used for DatabaseService.getLastFetchTime/updateLastFetchTime(...)'s per-entity
+    // fetch cursor.
+    private static final String PLATFORM = "reddit";
+    // Fixed delay between consecutive Apify calls (one per entity), so calls aren't back-to-back.
+    private static final long ENTITY_DELAY_MS = 60 * 60 * 1000; // 1 hour
 
     private static int numberOfPosts;
 
@@ -77,10 +84,12 @@ public class RedditApifyService implements SocialMediaScanner {
         actorInput.addProperty("scrapeComments", false);
         if (dateFrom != null) {
             actorInput.addProperty("dateFrom", dateFrom);
-            actorInput.addProperty("timeframe", "year");
+            actorInput.addProperty("timeframe", resolveTimeframe(dateFrom));
             // Without this, the Actor's default relevance-ranked traversal can under-cover the
             // tail of a wide date window; forcing chronological order + wider traversal is the
-            // Actor author's documented way to get full coverage over a whole year.
+            // Actor author's documented way to get full coverage over the whole [dateFrom, now]
+            // window (whether that's the ~365-day historical backfill or a short incremental gap
+            // since the last scan).
             actorInput.addProperty("forceSortNewForTimeFilteredRuns", true);
             actorInput.addProperty("maximize_coverage", true);
         }
@@ -175,6 +184,38 @@ public class RedditApifyService implements SocialMediaScanner {
         return post;
     }
 
+    // Picks the narrowest Reddit search timeframe ("day"/"week"/"month"/"year") that still covers
+    // [dateFrom, now]. This is used both by the ~365-day one-time backfill (-> "year", the previous
+    // hardcoded value) and by the regular scan's short incremental cursor (typically <1 day old
+    // -> "day"), instead of always requesting a full year of search coverage for a gap of a few hours.
+    private static String resolveTimeframe(String dateFrom) {
+        Instant from = parseDateFromAsInstant(dateFrom);
+        if (from == null) {
+            return "year";
+        }
+        long daysAgo = ChronoUnit.DAYS.between(from, Instant.now());
+        if (daysAgo <= 1) {
+            return "day";
+        } else if (daysAgo <= 7) {
+            return "week";
+        } else if (daysAgo <= 31) {
+            return "month";
+        }
+        return "year";
+    }
+
+    private static Instant parseDateFromAsInstant(String dateFrom) {
+        try {
+            return Instant.parse(dateFrom);
+        } catch (Exception e) {
+            try {
+                return LocalDate.parse(dateFrom).atStartOfDay(ZoneOffset.UTC).toInstant();
+            } catch (Exception e2) {
+                return null;
+            }
+        }
+    }
+
     // Copies a field through as-is (preserving its JSON type) only when present and non-null, so
     // DatabaseService's has()-check writes a real SQL NULL for anything the Actor didn't return.
     private static void copyIfPresent(JsonObject target, String targetKey, JsonObject source, String sourceKey) {
@@ -245,10 +286,17 @@ public class RedditApifyService implements SocialMediaScanner {
                     continue;
                 }
                 String category = queries.get(0).get("category").getAsString();
-                search(entity, keywords, category);
-                long delay = ThreadLocalRandom.current().nextLong(300000, 600001);
-                System.out.println(System.currentTimeMillis() + ": Waiting for " + (delay / 60000) + " minutes before the next entity...");
-                Thread.sleep(delay);
+
+                // Only ask the Actor for posts newer than this entity's last successful fetch, so a
+                // repeat scan isn't billed again for content already saved. First-ever fetch for an
+                // entity has no cursor yet and behaves like today (no lower bound).
+                Instant lastFetch = DatabaseService.getLastFetchTime(PLATFORM, entity);
+                Instant scanStart = Instant.now();
+                search(entity, keywords, category, numberOfPosts, lastFetch != null ? lastFetch.toString() : null, null);
+                DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
+
+                System.out.println(System.currentTimeMillis() + ": Waiting 60 minutes before the next entity...");
+                Thread.sleep(ENTITY_DELAY_MS);
             }
         } catch (Exception e) {
             System.err.println("An unrecoverable error occurred during the Reddit Apify scan.");
