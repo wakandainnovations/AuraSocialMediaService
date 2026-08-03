@@ -36,6 +36,11 @@ public class RedditApifyService implements SocialMediaScanner {
     private static final String PLATFORM = "reddit";
     // Fixed delay between consecutive Apify calls (one per entity), so calls aren't back-to-back.
     private static final long ENTITY_DELAY_MS = 60 * 60 * 1000; // 1 hour
+    // The Actor rejects anything but a strict YYYY-MM-DD for dateFrom/dateTo (400 invalid-input),
+    // so Instant.toString()'s full ISO-8601 timestamp (e.g. "2026-08-04T10:15:30.123Z") can't be
+    // passed through as-is.
+    private static final java.time.format.DateTimeFormatter DATE_FORMATTER =
+            java.time.format.DateTimeFormatter.ISO_LOCAL_DATE.withZone(ZoneOffset.UTC);
 
     private static int numberOfPosts;
 
@@ -66,8 +71,9 @@ public class RedditApifyService implements SocialMediaScanner {
 
     /**
      * Same as {@link #search(String, List, String)} but lets the caller override the post cap and
-     * bound results to a [dateFrom, dateTo] window (ISO-8601 or YYYY-MM-DD; either may be null).
-     * Used by HistoricalBackfillService, which runs concurrently with the regular scheduled scan
+     * bound results to a [dateFrom, dateTo] window (strict YYYY-MM-DD per the Actor's input schema;
+     * either may be null). Used by HistoricalBackfillService, which runs concurrently with the
+     * regular scheduled scan
      * and so can't share the mutable {@code numberOfPosts} field. Unlike Instagram's Actor, this
      * one supports server-side date bounds, so no client-side post-filtering is needed.
      */
@@ -292,7 +298,7 @@ public class RedditApifyService implements SocialMediaScanner {
                 // entity has no cursor yet and behaves like today (no lower bound).
                 Instant lastFetch = DatabaseService.getLastFetchTime(PLATFORM, entity);
                 Instant scanStart = Instant.now();
-                search(entity, keywords, category, numberOfPosts, lastFetch != null ? lastFetch.toString() : null, null);
+                search(entity, keywords, category, numberOfPosts, lastFetch != null ? DATE_FORMATTER.format(lastFetch) : null, null);
                 DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
 
                 System.out.println(System.currentTimeMillis() + ": Waiting 60 minutes before the next entity...");
