@@ -29,6 +29,12 @@ import java.util.stream.Collectors;
  */
 public class XService implements SocialMediaScanner {
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
+    // scan() only sets up recurring jobs on `scheduler` and returns immediately; Main's outer
+    // polling loop treats that fast return as a completed scan and calls scan() again every
+    // hour. Without this guard, each call re-registers another set of scheduleAtFixedRate
+    // tasks (search + refreshMetrics) on top of the still-running ones, so after a few hours
+    // multiple refreshMetrics jobs run concurrently and deadlock on overlapping x_posts rows.
+    private final java.util.concurrent.atomic.AtomicBoolean initialized = new java.util.concurrent.atomic.AtomicBoolean(false);
     private static String ACCESS_TOKEN;
 //    private static final String API_URL = "https://api.twitter.com/2";
     private static final String API_URL = "https://api.x.com/2";
@@ -346,6 +352,10 @@ public class XService implements SocialMediaScanner {
 
     @Override
     public void scan() {
+        if (!initialized.compareAndSet(false, true)) {
+            // Recurring jobs are already scheduled from the first call; nothing more to do.
+            return;
+        }
         try {
             loadConfig();
             System.out.println("Initializing X Search...");
@@ -400,6 +410,8 @@ public class XService implements SocialMediaScanner {
         } catch (Exception e) {
             System.err.println("An unrecoverable error occurred during the process.");
             e.printStackTrace();
+            // Setup didn't complete (e.g. loadConfig failed) — allow Main's retry loop to try again.
+            initialized.set(false);
         }
     }
 }
