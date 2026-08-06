@@ -76,7 +76,9 @@ public class YouTubeMain implements SocialMediaScanner {
      * Searches YouTube for a single entity. The entity's keywords are combined into one OR'd video
      * search (e.g. "GDN|GDNaidu"), so a video matching several keywords is found once and its comments
      * are fetched (and stored) once instead of once per keyword. Comments are deduped per entity via
-     * the composite id commentId_entity in saveYouTubeComments(...).
+     * the composite id commentId_entity, and cross-source (Data API vs. Apify fallback) via
+     * content_hash, both in saveYouTubeComments(...). Once the Data API's quota is exhausted
+     * mid-run, remaining videos fall back to YouTubeCommentsApifyService.
      */
     public static void search(String entity, List<String> keywords, String category) throws Exception {
         String combinedQuery = buildQuery(keywords);
@@ -97,6 +99,10 @@ public class YouTubeMain implements SocialMediaScanner {
         Set<String> seenVideoIds = new HashSet<>();
         // Keeps first-seen order/snippet for the like/view/comment-count upsert below.
         Map<String, SearchResult> uniqueVideos = new LinkedHashMap<>();
+        // Once the Data API's quota is hit for one video, every other call in this run will fail
+        // the same way; the rest of this run's videos go straight to the Apify fallback instead of
+        // wasting a doomed API call first.
+        boolean youtubeApiQuotaExceeded = false;
 
         for (SearchResult video : videos) {
             String videoId = video.getId().getVideoId();
@@ -104,36 +110,36 @@ public class YouTubeMain implements SocialMediaScanner {
                 continue;
             }
             uniqueVideos.put(videoId, video);
-            System.out.println("\nFetching " + numberOfComments + " comments for video: " + video.getSnippet().getTitle() + " (ID: " + videoId + ")");
+            String videoTitle = video.getSnippet().getTitle();
+            System.out.println("\nFetching " + numberOfComments + " comments for video: " + videoTitle + " (ID: " + videoId + ")");
 
-            // *******************************************
-            // 1. Retrieve the last ETag from your DB for this specific video
-            String lastETag = DatabaseService.getVideoETag(videoId);
-            // *******************************************
-            List<CommentThread> comments = service.getComments(videoId, numberOfComments, lastETag);
+            JsonArray commentDocs = null;
 
-            if (comments.isEmpty()) {
-                System.out.println("No comments found for video ID: " + videoId);
-                continue;
+            if (!youtubeApiQuotaExceeded) {
+                // Retrieve the last ETag from the DB for this specific video, so an unchanged video
+                // costs 0 quota units (a 304) instead of a full comments read.
+                String lastETag = DatabaseService.getVideoETag(videoId);
+                try {
+                    List<CommentThread> comments = service.getComments(videoId, numberOfComments, lastETag);
+                    if (comments.isEmpty()) {
+                        System.out.println("No comments found for video ID: " + videoId);
+                    } else {
+                        // Capture the NEW ETag from the first item to use for the next hourly poll
+                        DatabaseService.saveVideoETag(videoId, comments.get(0).getEtag());
+                        commentDocs = toCommentDocs(comments, videoId, videoTitle);
+                    }
+                } catch (YouTubeQuotaExceededException e) {
+                    System.err.println(e.getMessage() + ". Falling back to Apify comments for the rest of this run.");
+                    youtubeApiQuotaExceeded = true;
+                }
             }
 
-            // Capture the NEW ETag from the first item to use for the next hourly poll
-            String newETag = comments.get(0).getEtag();
-            DatabaseService.saveVideoETag(videoId, newETag);
+            if (youtubeApiQuotaExceeded) {
+                commentDocs = YouTubeCommentsApifyService.fetchCommentsIfDue(videoId, videoTitle, numberOfComments);
+            }
 
-            for (CommentThread commentThread : comments) {
-                CommentSnippet snippet = commentThread.getSnippet().getTopLevelComment().getSnippet();
-                JsonObject commentJson = new JsonObject();
-                commentJson.addProperty("video_id", videoId);
-                commentJson.addProperty("video_title", video.getSnippet().getTitle());
-                commentJson.addProperty("comment_id", commentThread.getId());
-                commentJson.addProperty("text", snippet.getTextDisplay());
-                commentJson.addProperty("author", snippet.getAuthorDisplayName());
-                commentJson.addProperty("likes_count", snippet.getLikeCount());
-                commentJson.addProperty("reply_count", commentThread.getSnippet().getTotalReplyCount());
-                commentJson.addProperty("published_at", snippet.getPublishedAt().toString());
-                commentJson.addProperty("permalink", "https://www.youtube.com/watch?v=" + videoId + "&lc=" + commentThread.getId());
-                videoComments.add(commentJson);
+            if (commentDocs != null) {
+                commentDocs.forEach(videoComments::add);
             }
         }
 
@@ -179,6 +185,27 @@ public class YouTubeMain implements SocialMediaScanner {
     // Builds the OR'd video-search query for a set of keywords. YouTube's `q` uses '|' for OR.
     private static String buildQuery(List<String> keywords) {
         return keywords.size() == 1 ? keywords.get(0) : String.join("|", keywords);
+    }
+
+    // Reshapes native Data API comment threads into the schema shared with
+    // YouTubeCommentsApifyService's Apify-sourced comments, so both feed DatabaseService.saveYouTubeComments(...) unmodified.
+    private static JsonArray toCommentDocs(List<CommentThread> comments, String videoId, String videoTitle) {
+        JsonArray docs = new JsonArray();
+        for (CommentThread commentThread : comments) {
+            CommentSnippet snippet = commentThread.getSnippet().getTopLevelComment().getSnippet();
+            JsonObject commentJson = new JsonObject();
+            commentJson.addProperty("video_id", videoId);
+            commentJson.addProperty("video_title", videoTitle);
+            commentJson.addProperty("comment_id", commentThread.getId());
+            commentJson.addProperty("text", snippet.getTextDisplay());
+            commentJson.addProperty("author", snippet.getAuthorDisplayName());
+            commentJson.addProperty("likes_count", snippet.getLikeCount());
+            commentJson.addProperty("reply_count", commentThread.getSnippet().getTotalReplyCount());
+            commentJson.addProperty("published_at", snippet.getPublishedAt().toString());
+            commentJson.addProperty("permalink", "https://www.youtube.com/watch?v=" + videoId + "&lc=" + commentThread.getId());
+            docs.add(commentJson);
+        }
+        return docs;
     }
 
     @Override

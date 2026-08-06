@@ -1,6 +1,7 @@
 package com.lit.fire.flame;
 
 import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport;
+import com.google.api.client.googleapis.json.GoogleJsonError;
 import com.google.api.client.googleapis.json.GoogleJsonResponseException;
 import com.google.api.client.http.HttpTransport;
 import com.google.api.client.json.JsonFactory;
@@ -151,6 +152,10 @@ public class YouTubeService {
                 System.out.println("No new comments for video: " + videoId + " (Quota saved!)");
                 return Collections.emptyList();
             }
+            if (isQuotaExceeded(e)) {
+                throw new YouTubeQuotaExceededException(
+                        "YouTube API quota exceeded while fetching comments for video " + videoId, e);
+            }
             if (e.getStatusCode() == 403) {
                 System.err.println("Comments disabled for video: " + videoId);
             }
@@ -206,5 +211,25 @@ public class YouTubeService {
         }
 
         return statsByVideoId;
+    }
+
+    // Distinguishes a genuine quota/rate-limit 403 (project-wide, not video-specific - the rest of
+    // this run's API calls will fail the same way) from a video-specific 403 like comments being
+    // disabled, which callers should just skip past.
+    private static boolean isQuotaExceeded(GoogleJsonResponseException e) {
+        GoogleJsonError details = e.getDetails();
+        if (details == null) {
+            return false;
+        }
+        if (details.getErrors() != null) {
+            for (GoogleJsonError.ErrorInfo error : details.getErrors()) {
+                String reason = error.getReason();
+                if ("quotaExceeded".equals(reason) || "dailyLimitExceeded".equals(reason) || "rateLimitExceeded".equals(reason)) {
+                    return true;
+                }
+            }
+        }
+        String message = details.getMessage();
+        return message != null && message.toLowerCase().contains("quota");
     }
 }

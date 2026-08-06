@@ -247,7 +247,13 @@ public class DatabaseService {
     // (comma-joined), falling back to the entity name (the keyword usually matched the video, not
     // the comment body).
     public static void saveYouTubeComments(JsonArray comments, String entity, List<String> keywords, String category) throws Exception {
-        String sql = "INSERT INTO youtube_comments (id, video_id, video_title, text, author, published_at, permalink, entity, keyword, sentiment_category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO NOTHING";
+        // No conflict target: this lets ON CONFLICT DO NOTHING catch both a literal id collision
+        // (same source re-fetching a comment it already stored) AND a content_hash collision (the
+        // same physical comment reaching us from two different sources - the native Data API and
+        // the Apify fallback don't share a comment-id scheme, so their "id" values differ even for
+        // the same comment). See content_hash(...) below and V5__add_youtube_comment_dedup_and_backoff.sql.
+        String sql = "INSERT INTO youtube_comments (id, video_id, video_title, text, author, published_at, permalink, entity, keyword, sentiment_category, content_hash) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING";
 
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -256,11 +262,14 @@ public class DatabaseService {
                 JsonObject comment = commentElement.getAsJsonObject();
 
                 String text = comment.get("text").getAsString();
+                String videoId = comment.get("video_id").getAsString();
+                String author = comment.get("author").getAsString();
+
                 pstmt.setString(1, comment.get("comment_id").getAsString() + "_" + entity);
-                pstmt.setString(2, comment.get("video_id").getAsString());
+                pstmt.setString(2, videoId);
                 pstmt.setString(3, comment.get("video_title").getAsString());
                 pstmt.setString(4, text);
-                pstmt.setString(5, comment.get("author").getAsString());
+                pstmt.setString(5, author);
 
                 String timestampString = comment.get("published_at").getAsString();
                 Instant instant = Instant.parse(timestampString);
@@ -269,6 +278,7 @@ public class DatabaseService {
                 pstmt.setString(8, entity);
                 pstmt.setString(9, matchedKeywords(text, entity, keywords));
                 pstmt.setString(10, category);
+                pstmt.setString(11, contentHash(videoId, entity, author, text));
 
                 pstmt.addBatch();
             }
@@ -279,6 +289,24 @@ public class DatabaseService {
         } catch (SQLException e) {
             System.err.println("Database error: " + e.getMessage());
             e.printStackTrace();
+        }
+    }
+
+    // Identifies a comment by its actual content rather than by a source-specific comment id, so
+    // the same physical comment fetched once via the Data API and once via the Apify fallback
+    // (whose "cid" values don't correspond to the Data API's comment ids) dedupes to one row.
+    private static String contentHash(String videoId, String entity, String author, String text) {
+        try {
+            String raw = videoId + "|" + entity + "|" + author + "|" + text;
+            byte[] digest = java.security.MessageDigest.getInstance("MD5")
+                    .digest(raw.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : digest) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
         }
     }
 
@@ -454,6 +482,63 @@ public class DatabaseService {
             pstmt.setString(2, entity);
             pstmt.setTimestamp(3, Timestamp.from(fetchedAt));
             pstmt.setTimestamp(4, Timestamp.from(fetchedAt));
+            pstmt.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("Database error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    // Per-video backoff state for YouTubeCommentsApifyService.fetchCommentsIfDue(...): the hash of
+    // the video's most recently fetched comment set, when it's next due for another Apify run, and
+    // the backoff interval that produced that next-due time (doubled again if the next fetch also
+    // comes back unchanged, reset to the base interval if it doesn't).
+    public static class YoutubeCommentCursor {
+        public final String commentsHash;
+        public final Instant nextFetchAt;
+        public final long backoffSeconds;
+
+        public YoutubeCommentCursor(String commentsHash, Instant nextFetchAt, long backoffSeconds) {
+            this.commentsHash = commentsHash;
+            this.nextFetchAt = nextFetchAt;
+            this.backoffSeconds = backoffSeconds;
+        }
+    }
+
+    public static YoutubeCommentCursor getYoutubeCommentCursor(String videoId) {
+        String sql = "SELECT comments_hash, next_fetch_at, backoff_seconds FROM youtube_video_comment_cursor WHERE video_id = ?";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, videoId);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                if (rs.next()) {
+                    Timestamp ts = rs.getTimestamp("next_fetch_at");
+                    return new YoutubeCommentCursor(
+                            rs.getString("comments_hash"),
+                            ts != null ? ts.toInstant() : null,
+                            rs.getLong("backoff_seconds"));
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Database error: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    public static void upsertYoutubeCommentCursor(String videoId, String commentsHash, Instant nextFetchAt, long backoffSeconds) {
+        String sql = "INSERT INTO youtube_video_comment_cursor (video_id, comments_hash, next_fetch_at, backoff_seconds, updated_at) " +
+                "VALUES (?, ?, ?, ?, NOW()) " +
+                "ON CONFLICT (video_id) DO UPDATE SET comments_hash = ?, next_fetch_at = ?, backoff_seconds = ?, updated_at = NOW()";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, videoId);
+            pstmt.setString(2, commentsHash);
+            pstmt.setTimestamp(3, Timestamp.from(nextFetchAt));
+            pstmt.setLong(4, backoffSeconds);
+            pstmt.setString(5, commentsHash);
+            pstmt.setTimestamp(6, Timestamp.from(nextFetchAt));
+            pstmt.setLong(7, backoffSeconds);
             pstmt.executeUpdate();
         } catch (SQLException e) {
             System.err.println("Database error: " + e.getMessage());
