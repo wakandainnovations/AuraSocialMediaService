@@ -186,9 +186,9 @@ public class InstagramApifyService implements SocialMediaScanner {
         }
         copyIfPresent(post, "is_paid_partnership", item, "paidPartnership");
         if (item.has("videoPlayCount") && !item.get("videoPlayCount").isJsonNull()) {
-            post.add("play_count", item.get("videoPlayCount"));
+            post.add("views", item.get("videoPlayCount"));
         } else {
-            copyIfPresent(post, "play_count", item, "igPlayCount");
+            copyIfPresent(post, "views", item, "igPlayCount");
         }
         copyIfPresent(post, "reshare_count", item, "reshareCount");
         copyIfPresent(post, "location_name", item, "locationName");

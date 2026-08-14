@@ -111,10 +111,10 @@ public class DatabaseService {
     // Columns after comments_count are Apify-sourced extras; native (Graph API) posts leave them NULL.
     public static void saveInstagramPosts(JsonArray posts, String entity, List<String> keywords, String category) throws Exception {
         String sql = "INSERT INTO instagram_posts (id, text, media_type, media_url, permalink, timestamp, entity, keyword, sentiment_category, author, like_count, comments_count, " +
-                "shortcode, product_type, author_id, author_full_name, author_is_verified, author_follower_count, video_url, duration_seconds, hashtags, mentions, is_paid_partnership, play_count, reshare_count, location_name) " +
+                "shortcode, product_type, author_id, author_full_name, author_is_verified, author_follower_count, video_url, duration_seconds, hashtags, mentions, is_paid_partnership, views, reshare_count, location_name) " +
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
                 "ON CONFLICT (id) DO UPDATE SET like_count = EXCLUDED.like_count, comments_count = EXCLUDED.comments_count, " +
-                "play_count = EXCLUDED.play_count, reshare_count = EXCLUDED.reshare_count";
+                "views = EXCLUDED.views, reshare_count = EXCLUDED.reshare_count";
 
         try (Connection conn = getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -152,7 +152,7 @@ public class DatabaseService {
                 setNullableString(pstmt, 21, post, "hashtags");
                 setNullableString(pstmt, 22, post, "mentions");
                 setNullableBoolean(pstmt, 23, post, "is_paid_partnership");
-                setNullableInt(pstmt, 24, post, "play_count");
+                setNullableInt(pstmt, 24, post, "views");
                 setNullableInt(pstmt, 25, post, "reshare_count");
                 setNullableString(pstmt, 26, post, "location_name");
 
