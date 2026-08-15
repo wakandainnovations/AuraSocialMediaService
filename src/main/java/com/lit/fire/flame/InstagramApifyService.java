@@ -129,8 +129,11 @@ public class InstagramApifyService implements SocialMediaScanner {
      * Backfills "views" on video posts among the entity's top {@link #VIEW_ENRICHMENT_LIMIT}
      * hashtag-scraper results by looking them up individually via the Instagram Reel Scraper Actor,
      * which (unlike the hashtag scraper) returns videoPlayCount/videoViewCount. Image/Sidecar posts
-     * are skipped since that data doesn't apply to them. Runs best-effort: a failure here shouldn't
-     * stop the entity's posts from being saved without view counts.
+     * are skipped since that data doesn't apply to them. Posts already known from a previous fetch
+     * (same underlying Instagram post scraped under another entity's hashtags) are filled in from the
+     * database instead of spending another Actor call on them - see
+     * DatabaseService.getKnownInstagramViews(...). Runs best-effort: a failure here shouldn't stop
+     * the entity's posts from being saved without view counts.
      */
     private static void enrichViewCounts(JsonArray entityPosts, String entity) {
         if (!VIEW_ENRICHMENT_ENABLED) {
@@ -145,6 +148,17 @@ public class InstagramApifyService implements SocialMediaScanner {
             }
         }
         if (videoPostsById.isEmpty()) {
+            return;
+        }
+
+        Map<String, Integer> knownViews = DatabaseService.getKnownInstagramViews(new ArrayList<>(videoPostsById.keySet()));
+        for (Map.Entry<String, Integer> known : knownViews.entrySet()) {
+            videoPostsById.remove(known.getKey()).addProperty("views", known.getValue());
+        }
+        if (videoPostsById.isEmpty()) {
+            if (!knownViews.isEmpty()) {
+                System.out.println("[Apify/Instagram] '" + entity + "': reused " + knownViews.size() + " already-known view count(s), no Reel Scraper call needed.");
+            }
             return;
         }
 
@@ -172,7 +186,8 @@ public class InstagramApifyService implements SocialMediaScanner {
                     post.add("views", reelItem.get("videoViewCount"));
                 }
             }
-            System.out.println("[Apify/Instagram] '" + entity + "': enriched view counts for " + videoPostsById.size() + " video post(s).");
+            System.out.println("[Apify/Instagram] '" + entity + "': fetched view counts for " + videoPostsById.size() +
+                    " video post(s) via Reel Scraper" + (knownViews.isEmpty() ? "" : " (" + knownViews.size() + " more reused from an earlier fetch)") + ".");
         } catch (Exception e) {
             System.err.println("[Apify/Instagram] '" + entity + "': view-count enrichment failed, continuing without it. " + e.getMessage());
         }

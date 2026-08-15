@@ -168,6 +168,34 @@ public class DatabaseService {
         }
     }
 
+    // instagram_posts.id is "postId_entity" (see saveInstagramPosts), and the same underlying
+    // Instagram post can be scraped under more than one entity's hashtags. This lets callers reuse a
+    // views value already fetched for a post under any entity, instead of paying to re-fetch it via
+    // the (per-item-billed) Instagram Reel Scraper Actor for every entity it happens to match.
+    // postId itself is always purely numeric (no underscores), so splitting on the first "_" reliably
+    // recovers it regardless of what characters the entity name contains.
+    public static Map<String, Integer> getKnownInstagramViews(List<String> postIds) {
+        Map<String, Integer> result = new HashMap<>();
+        if (postIds.isEmpty()) {
+            return result;
+        }
+        String sql = "SELECT split_part(id, '_', 1) AS post_id, views FROM instagram_posts " +
+                "WHERE split_part(id, '_', 1) = ANY(?) AND views IS NOT NULL";
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setArray(1, conn.createArrayOf("varchar", postIds.toArray()));
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    result.putIfAbsent(rs.getString("post_id"), rs.getInt("views"));
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Database error: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return result;
+    }
+
     // Posts are now keyed/deduped per entity: the composite id is tweetId_entity, so a tweet that
     // matched several of the entity's keywords is stored once. The `keyword` column records which of
     // the entity's keywords actually appear in the tweet text (comma-joined), falling back to the
