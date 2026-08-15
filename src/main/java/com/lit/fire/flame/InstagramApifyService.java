@@ -29,6 +29,16 @@ import java.util.stream.Collectors;
 public class InstagramApifyService implements SocialMediaScanner {
 
     private static final String ACTOR_ID = "apify/instagram-hashtag-scraper";
+    // The hashtag scraper never returns video play/view counts (that data isn't part of its output
+    // schema); this dedicated Actor accepts direct reel/post URLs and does return them
+    // (videoPlayCount/videoViewCount), so it's used as a follow-up call to backfill "views".
+    private static final String REEL_ACTOR_ID = "apify/instagram-reel-scraper";
+    // Reel Scraper is billed per item, unlike the flat-fee hashtag scraper, so view-count
+    // enrichment is capped to the entity's top N hashtag-scraper results rather than run for all of them.
+    private static final int VIEW_ENRICHMENT_LIMIT = 20;
+    // Off until the Apify account is topped up; flip to true to resume backfilling "views" via
+    // REEL_ACTOR_ID.
+    private static final boolean VIEW_ENRICHMENT_ENABLED = false;
     // Matches the format DatabaseService.saveInstagramPosts(...) parses its "timestamp" field with.
     private static final DateTimeFormatter TIMESTAMP_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ssZ");
     // Platform key used for DatabaseService.getLastFetchTime/updateLastFetchTime(...)'s per-entity
@@ -108,8 +118,63 @@ public class InstagramApifyService implements SocialMediaScanner {
             entityPosts.add(post);
         }
 
+        enrichViewCounts(entityPosts, entity);
+
         if (entityPosts.size() > 0) {
             DatabaseService.saveInstagramPosts(entityPosts, entity, keywords, category);
+        }
+    }
+
+    /**
+     * Backfills "views" on video posts among the entity's top {@link #VIEW_ENRICHMENT_LIMIT}
+     * hashtag-scraper results by looking them up individually via the Instagram Reel Scraper Actor,
+     * which (unlike the hashtag scraper) returns videoPlayCount/videoViewCount. Image/Sidecar posts
+     * are skipped since that data doesn't apply to them. Runs best-effort: a failure here shouldn't
+     * stop the entity's posts from being saved without view counts.
+     */
+    private static void enrichViewCounts(JsonArray entityPosts, String entity) {
+        if (!VIEW_ENRICHMENT_ENABLED) {
+            return;
+        }
+        Map<String, JsonObject> videoPostsById = new LinkedHashMap<>();
+        int limit = Math.min(entityPosts.size(), VIEW_ENRICHMENT_LIMIT);
+        for (int i = 0; i < limit; i++) {
+            JsonObject post = entityPosts.get(i).getAsJsonObject();
+            if ("VIDEO".equals(post.get("media_type").getAsString())) {
+                videoPostsById.put(post.get("id").getAsString(), post);
+            }
+        }
+        if (videoPostsById.isEmpty()) {
+            return;
+        }
+
+        try {
+            JsonArray permalinks = new JsonArray();
+            for (JsonObject post : videoPostsById.values()) {
+                permalinks.add(post.get("permalink").getAsString());
+            }
+            JsonObject actorInput = new JsonObject();
+            actorInput.add("username", permalinks);
+
+            JsonArray reelItems = ApifyClient.runActorAndGetDatasetItems(REEL_ACTOR_ID, actorInput);
+            for (JsonElement el : reelItems) {
+                JsonObject reelItem = el.getAsJsonObject();
+                if (!reelItem.has("id") || reelItem.get("id").isJsonNull()) {
+                    continue;
+                }
+                JsonObject post = videoPostsById.get(reelItem.get("id").getAsString());
+                if (post == null) {
+                    continue;
+                }
+                if (reelItem.has("videoPlayCount") && !reelItem.get("videoPlayCount").isJsonNull()) {
+                    post.add("views", reelItem.get("videoPlayCount"));
+                } else if (reelItem.has("videoViewCount") && !reelItem.get("videoViewCount").isJsonNull()) {
+                    post.add("views", reelItem.get("videoViewCount"));
+                }
+            }
+            System.out.println("[Apify/Instagram] '" + entity + "': enriched view counts for " + videoPostsById.size() + " video post(s).");
+        } catch (Exception e) {
+            System.err.println("[Apify/Instagram] '" + entity + "': view-count enrichment failed, continuing without it. " + e.getMessage());
         }
     }
 
