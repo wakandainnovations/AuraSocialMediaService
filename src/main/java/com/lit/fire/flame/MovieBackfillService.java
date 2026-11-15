@@ -13,7 +13,7 @@ import java.util.stream.Collectors;
  * caller-supplied trailing window (e.g. "last 3 months"). Unlike HistoricalBackfillService (which
  * backfills a fixed 365-day window for every DB-managed Tamil/Kannada MOVIE entity), this takes an
  * arbitrary entity/keyword pair directly on the command line, so it isn't limited to entities
- * already tracked in search_queries.txt / managed_entities.
+ * already tracked in tracked_releases / managed_entities.
  *
  * Cost-conscious by construction:
  *  - Posts only, not comments, on X/Reddit/Instagram (comment collection isn't built for those

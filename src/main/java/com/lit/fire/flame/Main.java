@@ -12,6 +12,8 @@ public class Main {
     // already takes ~7-8 hours; waiting another 12 hours after it completes keeps full-cycle cost
     // down (~19-20h cadence) instead of restarting an already-hours-long pass every hour.
     private static final long APIFY_SUCCESS_DELAY_MS = 12 * 60 * 60 * 1000; // 12 hours
+    // TMDB release discovery (ReleaseDiscoveryService) - release dates move slowly, twice a day is plenty.
+    private static final long DISCOVERY_SUCCESS_DELAY_MS = 12 * 60 * 60 * 1000; // 12 hours
 
     private static class ScannableService implements Runnable {
         private final SocialMediaScanner scanner;
@@ -57,7 +59,21 @@ public class Main {
     }
 
     public static void main(String[] args) {
+        // Populate tracked_releases before the scanners load it, so the very first pass already
+        // covers every current release. A failure (e.g. TMDB down / no credential) isn't fatal:
+        // scanners still work off whatever is already in the table, and the scheduled discovery
+        // below retries.
+        ReleaseDiscoveryService discovery = new ReleaseDiscoveryService();
+        try {
+            discovery.scan();
+        } catch (Exception e) {
+            System.err.println("Initial release discovery failed: " + e.getMessage());
+        }
+
         List<ScannableService> services = new ArrayList<>();
+        ScannableService discoveryService = new ScannableService(discovery, "Release discovery", DISCOVERY_SUCCESS_DELAY_MS);
+        discoveryService.nextScanTime = System.currentTimeMillis() + DISCOVERY_SUCCESS_DELAY_MS;
+        services.add(discoveryService);
         // Instagram/Reddit are collected via Apify Actors (InstagramApifyService/RedditApifyService),
         // not the native Graph API / Reddit OAuth clients (InstagramService/RedditAuthClientWithSearch).
         services.add(new ScannableService(new InstagramApifyService(), "Instagram", APIFY_SUCCESS_DELAY_MS));

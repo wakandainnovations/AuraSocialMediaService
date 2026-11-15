@@ -27,7 +27,7 @@ public class DatabaseService {
     // Tunable: a post is considered to "have traction" if score strictly exceeds this.
     private static final int TRACTION_THRESHOLD = 0;
 
-    private static Connection getConnection() throws SQLException {
+    static Connection getConnection() throws SQLException {
         Properties dbProperties = null;
         try {
             dbProperties = loadDbProperties();

@@ -35,6 +35,7 @@ public class YouTubeMain implements SocialMediaScanner {
     private static int numberOfVideos;
     private static int numberOfComments;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
+    private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("YouTube", 14400, 60);
 
     // Package-private (not private) so MovieBackfillService can populate API_KEY/numberOfComments
     // before calling search(...) directly, without going through scan()'s scheduler setup.
@@ -58,21 +59,6 @@ public class YouTubeMain implements SocialMediaScanner {
         }
     }
 
-    private static List<JsonObject> loadInputQueries() throws Exception {
-        List<JsonObject> inputQueries = new ArrayList<>();
-        try (InputStream input = YouTubeMain.class.getClassLoader().getResourceAsStream("search_queries.txt")) {
-            if (input == null) {
-                System.out.println("Sorry, unable to find search_queries.txt");
-                return inputQueries;
-            }
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(input))) {
-                inputQueries = reader.lines()
-                        .map(line -> JsonParser.parseString(line).getAsJsonObject())
-                        .collect(Collectors.toList());
-            }
-        }
-        return inputQueries;
-    }
 
     /**
      * Searches YouTube for a single entity. The entity's keywords are combined into one OR'd video
@@ -222,48 +208,31 @@ public class YouTubeMain implements SocialMediaScanner {
 
     @Override
     public void scan() {
+        if (scheduler.isShutdown()) {
+            // Quota exhaustion shut the scheduler down (see below); it stays down until restart.
+            System.out.println("YouTube scheduler is shut down (API quota exhausted); skipping entity sync.");
+            return;
+        }
         try {
             loadConfig();
-            System.out.println("Initializing YouTube Search...");
-            List<JsonObject> inputQueries = loadInputQueries();
-
-            // Group keyword lines by entity and poll once per entity (not per keyword), combining its
-            // keywords into one OR'd video search so a shared video's comments are read/stored once.
-            Map<String, List<JsonObject>> queriesByEntity = new LinkedHashMap<>();
-            for (JsonObject inputQuery : inputQueries) {
-                String entity = inputQuery.get("entity").getAsString();
-                queriesByEntity.computeIfAbsent(entity, k -> new ArrayList<>()).add(inputQuery);
-                DatabaseService.upsertEntityKeyword(inputQuery);
-            }
-
-            for (Map.Entry<String, List<JsonObject>> entry : queriesByEntity.entrySet()) {
-                String entity = entry.getKey();
-                List<JsonObject> queries = entry.getValue();
-                List<String> keywords = queries.stream()
-                        .map(q -> q.get("keyword").getAsString())
-                        .collect(Collectors.toList());
-                // Keyword lines of one entity share its category.
-                String category = queries.get(0).get("category").getAsString();
-                // SME Recommendation: Randomize initial delay so entities don't all hit the API at once
-                long initialDelay = ThreadLocalRandom.current().nextLong(0, 60);
-                System.out.println("\nProcessing entity: " + entity + " -> keywords " + keywords);
-                // Schedule the task to run every 4 hours (14400 seconds)
-                scheduler.scheduleAtFixedRate(() -> {
-                    try {
-                        System.out.println("\n[Scheduled Task] Starting: " + entity);
-                        search(entity, keywords, category);
-                    } catch (GoogleJsonResponseException e) {
-                        if (e.getDetails() != null && e.getDetails().getCode() == 403 && e.getDetails().getMessage().contains("quota")) {
-                            System.err.println("YouTube API quota exceeded. Shutting down all tasks.");
-                            scheduler.shutdown();
-                        } else {
-                            System.err.println("Google API error for " + entity + ": " + e.getMessage());
-                        }
-                    } catch (Exception e) {
-                        System.err.println("Error in scheduled task for " + entity + ": " + e.getMessage());
+            System.out.println("Syncing YouTube entity polls...");
+            // Reconciles against the tracked-release list on every scan() (Main calls it hourly):
+            // one poll per entity every 4 hours, keywords combined into one OR'd video search so a
+            // shared video's comments are read/stored once. Previously each scan() re-scheduled
+            // every entity again, stacking duplicate polls hour after hour.
+            entitySchedule.sync(scheduler, (entity, keywords, category) -> {
+                try {
+                    search(entity, keywords, category);
+                } catch (GoogleJsonResponseException e) {
+                    if (e.getDetails() != null && e.getDetails().getCode() == 403
+                            && e.getDetails().getMessage() != null && e.getDetails().getMessage().contains("quota")) {
+                        System.err.println("YouTube API quota exceeded. Shutting down all tasks.");
+                        scheduler.shutdown();
+                    } else {
+                        System.err.println("Google API error for " + entity + ": " + e.getMessage());
                     }
-                }, initialDelay, 14400, TimeUnit.SECONDS);            }
-
+                }
+            });
         } catch (Exception e) {
             System.err.println("An unrecoverable error occurred during the process.");
             e.printStackTrace();

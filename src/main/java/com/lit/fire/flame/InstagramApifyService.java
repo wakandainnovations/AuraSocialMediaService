@@ -49,20 +49,9 @@ public class InstagramApifyService implements SocialMediaScanner {
 
     private static int numberOfPosts;
 
-    private static List<JsonObject> loadInputQueries() throws Exception {
-        List<JsonObject> inputQueries = new ArrayList<>();
-        try (InputStream input = InstagramApifyService.class.getClassLoader().getResourceAsStream("search_queries.txt")) {
-            if (input == null) {
-                System.out.println("Sorry, unable to find search_queries.txt");
-                return inputQueries;
-            }
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(input))) {
-                inputQueries = reader.lines()
-                        .map(line -> JsonParser.parseString(line).getAsJsonObject())
-                        .collect(Collectors.toList());
-            }
-        }
-        return inputQueries;
+    // The tracked-release list (auto-discovered + admin-edited), not search_queries.txt.
+    private static List<JsonObject> loadInputQueries() {
+        return TrackedReleaseSource.loadInputQueries();
     }
 
     /**
@@ -377,6 +366,12 @@ public class InstagramApifyService implements SocialMediaScanner {
                         .map(q -> q.get("keyword").getAsString())
                         .collect(Collectors.toList());
                 String category = queries.get(0).get("category").getAsString();
+                // A pass spends an hour per entity, so re-check: an admin exclusion (or the window
+                // closing) mid-pass skips the paid Actor run instead of waiting for the next pass.
+                if (!TrackedReleaseSource.isActive(entity)) {
+                    System.out.println("[Apify/Instagram] Skipping '" + entity + "' (no longer tracked).");
+                    continue;
+                }
                 System.out.println("\n[Apify/Instagram] Processing entity: " + entity + " -> keywords " + keywords);
 
                 // This Actor has no server-side date filter (unlike Reddit's), so it always returns

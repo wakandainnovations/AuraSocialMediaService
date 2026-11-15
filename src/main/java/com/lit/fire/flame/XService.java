@@ -35,6 +35,7 @@ public class XService implements SocialMediaScanner {
     // tasks (search + refreshMetrics) on top of the still-running ones, so after a few hours
     // multiple refreshMetrics jobs run concurrently and deadlock on overlapping x_posts rows.
     private final java.util.concurrent.atomic.AtomicBoolean initialized = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("Aura-X", 3600, 300);
     private static String ACCESS_TOKEN;
 //    private static final String API_URL = "https://api.twitter.com/2";
     private static final String API_URL = "https://api.x.com/2";
@@ -67,21 +68,6 @@ public class XService implements SocialMediaScanner {
         }
     }
 
-    private static List<JsonObject> loadInputQueries() throws Exception {
-        List<JsonObject> inputQueries = new ArrayList<>();
-        try (InputStream input = XService.class.getClassLoader().getResourceAsStream("search_queries.txt")) {
-            if (input == null) {
-                System.out.println("Sorry, unable to find search_queries.txt");
-                return inputQueries;
-            }
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(input))) {
-                inputQueries = reader.lines()
-                        .map(line -> JsonParser.parseString(line).getAsJsonObject())
-                        .collect(Collectors.toList());
-            }
-        }
-        return inputQueries;
-    }
 
     /**
      * Searches X/Twitter for a single entity. The entity's keywords are combined into OR'd
@@ -352,66 +338,33 @@ public class XService implements SocialMediaScanner {
 
     @Override
     public void scan() {
-        if (!initialized.compareAndSet(false, true)) {
-            // Recurring jobs are already scheduled from the first call; nothing more to do.
-            return;
-        }
-        try {
-            loadConfig();
-            System.out.println("Initializing X Search...");
-            List<JsonObject> inputQueries = loadInputQueries();
-
-            // Group keyword lines by entity. A single entity can own multiple keywords, but each
-            // line carries a unique keyword. We poll once per entity (not per keyword), combining
-            // its keywords into one OR'd query so a shared tweet is read once.
-            Map<String, List<JsonObject>> queriesByEntity = new LinkedHashMap<>();
-            for (JsonObject inputQuery : inputQueries) {
-                String entity = inputQuery.get("entity").getAsString();
-                queriesByEntity.computeIfAbsent(entity, k -> new ArrayList<>()).add(inputQuery);
-                DatabaseService.upsertEntityKeyword(inputQuery);
-            }
-
-            for (Map.Entry<String, List<JsonObject>> entry : queriesByEntity.entrySet()) {
-                String entity = entry.getKey();
-                List<JsonObject> queries = entry.getValue();
-                List<String> keywords = queries.stream()
-                        .map(q -> q.get("keyword").getAsString())
-                        .collect(Collectors.toList());
-                // Keyword lines of one entity share its category.
-                String category = queries.get(0).get("category").getAsString();
-                System.out.println("\nProcessing entity: " + entity + " -> keywords " + keywords);
-
-                // SME Recommendation: Stagger initial starts (0-5 mins)
-                // to avoid hitting X API rate limits for all entities at once.
-                long initialDelay = ThreadLocalRandom.current().nextLong(0, 301);
-
-                // Schedule the task to run every 1 hour (3600 seconds)
+        // One-time setup (config + the single hourly metrics refresh) stays guarded: re-registering
+        // refreshMetrics on every scan() is what deadlocked x_posts before.
+        if (initialized.compareAndSet(false, true)) {
+            try {
+                loadConfig();
+                System.out.println("Initializing X Search...");
+                // Hourly metrics refresh across all previously-collected posts (tiered policy in SQL).
                 scheduler.scheduleAtFixedRate(() -> {
                     try {
-                        System.out.println("\n[Aura-X] Polling for entity: " + entity);
-                        search(entity, keywords, category);
+                        refreshMetrics();
                     } catch (Exception e) {
-                        System.err.println("Search failed for entity " + entity + ": " + e.getMessage());
+                        System.err.println("refreshMetrics failed: " + e.getMessage());
                     }
-                }, initialDelay, 3600, TimeUnit.SECONDS);
-
-                System.out.println("Queued entity '" + entity + "' with initial delay of " + (initialDelay / 60) + " mins.");
+                }, 600, 3600, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                System.err.println("An unrecoverable error occurred during the process.");
+                e.printStackTrace();
+                // Setup didn't complete (e.g. loadConfig failed) — allow Main's retry loop to try again.
+                initialized.set(false);
+                return;
             }
-
-            // Hourly metrics refresh across all previously-collected posts (tiered policy in SQL).
-            scheduler.scheduleAtFixedRate(() -> {
-                try {
-                    refreshMetrics();
-                } catch (Exception e) {
-                    System.err.println("refreshMetrics failed: " + e.getMessage());
-                }
-            }, 600, 3600, TimeUnit.SECONDS);
-
-        } catch (Exception e) {
-            System.err.println("An unrecoverable error occurred during the process.");
-            e.printStackTrace();
-            // Setup didn't complete (e.g. loadConfig failed) — allow Main's retry loop to try again.
-            initialized.set(false);
         }
+
+        // Runs on every scan() (Main calls it hourly): the tracked-release list changes on its own
+        // as movies enter/leave their window or are excluded in the admin UI. One poll per entity,
+        // every hour, with its keywords combined into one OR'd query so a shared tweet is read
+        // once; initial starts are staggered over 0-5 min to avoid hitting X rate limits at once.
+        entitySchedule.sync(scheduler, XService::search);
     }
 }
