@@ -287,6 +287,11 @@ public class RedditApifyService implements SocialMediaScanner {
                     System.out.println("[Apify/Reddit] Skipping '" + entity + "' (no longer tracked).");
                     continue;
                 }
+                // Paid run: wait until the relevance check has cleared this movie from its X posts.
+                if (!TrackedReleaseSource.isApifyEligible(entity)) {
+                    System.out.println("[Apify/Reddit] Skipping '" + entity + "' (awaiting relevance check).");
+                    continue;
+                }
 
                 // Only ask the Actor for posts newer than this entity's last successful fetch, so a
                 // repeat scan isn't billed again for content already saved. First-ever fetch for an

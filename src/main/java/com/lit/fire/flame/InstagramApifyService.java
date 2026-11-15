@@ -372,6 +372,11 @@ public class InstagramApifyService implements SocialMediaScanner {
                     System.out.println("[Apify/Instagram] Skipping '" + entity + "' (no longer tracked).");
                     continue;
                 }
+                // Paid run: wait until the relevance check has cleared this movie from its X posts.
+                if (!TrackedReleaseSource.isApifyEligible(entity)) {
+                    System.out.println("[Apify/Instagram] Skipping '" + entity + "' (awaiting relevance check).");
+                    continue;
+                }
                 System.out.println("\n[Apify/Instagram] Processing entity: " + entity + " -> keywords " + keywords);
 
                 // This Actor has no server-side date filter (unlike Reddit's), so it always returns

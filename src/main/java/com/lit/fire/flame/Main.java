@@ -70,10 +70,25 @@ public class Main {
             System.err.println("Initial release discovery failed: " + e.getMessage());
         }
 
+        // Same for the relevance check: movies whose X posts already look on-topic are cleared for
+        // Instagram/Reddit before those scanners' first pass (they pass only every ~12h), instead of
+        // being skipped as "awaiting relevance check" until the next one.
+        RelevanceCheckService relevance = new RelevanceCheckService();
+        try {
+            relevance.scan();
+        } catch (Exception e) {
+            System.err.println("Initial relevance check failed: " + e.getMessage());
+        }
+
         List<ScannableService> services = new ArrayList<>();
         ScannableService discoveryService = new ScannableService(discovery, "Release discovery", DISCOVERY_SUCCESS_DELAY_MS);
         discoveryService.nextScanTime = System.currentTimeMillis() + DISCOVERY_SUCCESS_DELAY_MS;
         services.add(discoveryService);
+        // Hourly relevance check: auto-excludes movies whose keywords mostly match unrelated posts,
+        // and clears movies for the paid Apify scanners once their cheap X posts look on-topic.
+        ScannableService relevanceService = new ScannableService(relevance, "Relevance check");
+        relevanceService.nextScanTime = System.currentTimeMillis() + DEFAULT_SUCCESS_DELAY_MS;
+        services.add(relevanceService);
         // Instagram/Reddit are collected via Apify Actors (InstagramApifyService/RedditApifyService),
         // not the native Graph API / Reddit OAuth clients (InstagramService/RedditAuthClientWithSearch).
         services.add(new ScannableService(new InstagramApifyService(), "Instagram", APIFY_SUCCESS_DELAY_MS));

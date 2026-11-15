@@ -41,9 +41,13 @@ public class TmdbReleaseClient {
             Map.entry("kok", "konkani"), Map.entry("tcy", "tulu"), Map.entry("ne", "nepali"),
             Map.entry("mai", "maithili"), Map.entry("raj", "rajasthani"));
 
+    /** {@code contextTerms}: lead cast + director names (TMDB credits), used by the relevance check. */
     public record Release(int tmdbId, String title, String originalTitle, String language,
-                          LocalDate releaseDate, Double popularity, String posterPath) {
+                          LocalDate releaseDate, Double popularity, String posterPath, List<String> contextTerms) {
     }
+
+    // How many top-billed cast members count as movie context for the relevance check.
+    private static final int CONTEXT_CAST = 6;
 
     private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build();
     private final String bearerToken;
@@ -99,7 +103,7 @@ public class TmdbReleaseClient {
      * (anymore), so it isn't (re)tracked.
      */
     public Release fetch(int tmdbId, LocalDate notBefore) throws Exception {
-        JsonObject o = get(API_BASE + "/movie/" + tmdbId + "?append_to_response=release_dates");
+        JsonObject o = get(API_BASE + "/movie/" + tmdbId + "?append_to_response=release_dates,credits");
         LocalDate theatrical = indiaTheatricalDate(o, notBefore);
         return theatrical == null ? null : toRelease(o, theatrical);
     }
@@ -144,7 +148,29 @@ public class TmdbReleaseClient {
         String language = code == null ? null : LANGUAGES.getOrDefault(code.toLowerCase(), code.toLowerCase());
         Double popularity = o.has("popularity") && !o.get("popularity").isJsonNull() ? o.get("popularity").getAsDouble() : null;
         return new Release(o.get("id").getAsInt(), title, str(o, "original_title"), language,
-                releaseDate, popularity, str(o, "poster_path"));
+                releaseDate, popularity, str(o, "poster_path"), creditNames(o));
+    }
+
+    /** Top-billed cast and director(s) from an append_to_response=credits payload. */
+    static List<String> creditNames(JsonObject movie) {
+        List<String> names = new ArrayList<>();
+        if (!movie.has("credits") || !movie.get("credits").isJsonObject()) return names;
+        JsonObject credits = movie.getAsJsonObject("credits");
+        if (credits.has("cast")) {
+            for (JsonElement c : credits.getAsJsonArray("cast")) {
+                if (names.size() >= CONTEXT_CAST) break;
+                String n = str(c.getAsJsonObject(), "name");
+                if (n != null) names.add(n);
+            }
+        }
+        if (credits.has("crew")) {
+            for (JsonElement c : credits.getAsJsonArray("crew")) {
+                JsonObject m = c.getAsJsonObject();
+                String n = str(m, "name");
+                if (n != null && "Director".equals(str(m, "job")) && !names.contains(n)) names.add(n);
+            }
+        }
+        return names;
     }
 
     private JsonObject get(String url) throws Exception {

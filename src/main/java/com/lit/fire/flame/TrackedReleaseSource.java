@@ -165,7 +165,7 @@ public class TrackedReleaseSource {
         try (Connection conn = DatabaseService.getConnection()) {
             String update = "UPDATE tracked_releases SET title = ?, original_title = ?, language = ?, " +
                     "release_date = ?, track_from = ?, track_until = ?, popularity = ?, poster_path = ?, " +
-                    "updated_at = NOW() WHERE tmdb_id = ?";
+                    "context_terms = ?, updated_at = NOW() WHERE tmdb_id = ?";
             try (PreparedStatement pstmt = conn.prepareStatement(update)) {
                 pstmt.setString(1, r.title());
                 pstmt.setString(2, r.originalTitle());
@@ -175,7 +175,8 @@ public class TrackedReleaseSource {
                 pstmt.setDate(6, Date.valueOf(until));
                 setNullableDouble(pstmt, 7, r.popularity());
                 pstmt.setString(8, r.posterPath());
-                pstmt.setInt(9, r.tmdbId());
+                pstmt.setString(9, joinTerms(r.contextTerms()));
+                pstmt.setInt(10, r.tmdbId());
                 if (pstmt.executeUpdate() > 0) return false;
             }
 
@@ -186,9 +187,9 @@ public class TrackedReleaseSource {
             String entityName = uniqueEntityName(conn, r);
             String insert = "INSERT INTO tracked_releases (tmdb_id, entity_name, title, original_title, language, " +
                     "release_date, track_from, track_until, keywords, category, source, popularity, poster_path, " +
-                    "excluded, excluded_reason, excluded_at) " +
+                    "excluded, excluded_reason, excluded_at, context_terms) " +
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'media.movie', 'TMDB', ?, ?, ?, ?, " +
-                    "CASE WHEN ? THEN NOW() END) ON CONFLICT DO NOTHING";
+                    "CASE WHEN ? THEN NOW() END, ?) ON CONFLICT DO NOTHING";
             // Indian-language releases outside tracking.auto.track.languages (by default anything
             // but Tamil/Telugu/Kannada/Malayalam) are stored but start excluded - visible in the
             // admin UI and restorable there, never scanned until then. Insert-only, so a restored
@@ -209,6 +210,7 @@ public class TrackedReleaseSource {
                 pstmt.setBoolean(12, autoExclude);
                 pstmt.setString(13, autoExclude ? autoExcludeReason(r.language()) : null);
                 pstmt.setBoolean(14, autoExclude);
+                pstmt.setString(15, joinTerms(r.contextTerms()));
                 return pstmt.executeUpdate() > 0;
             }
         }
@@ -240,6 +242,34 @@ public class TrackedReleaseSource {
             if (!taken.contains(c)) return c;
         }
         return candidates.get(candidates.size() - 1);
+    }
+
+    private static String joinTerms(List<String> terms) {
+        if (terms == null || terms.isEmpty()) return null;
+        return String.join(",", terms.stream().map(t -> t.replace(",", " ").trim()).filter(t -> !t.isEmpty()).toList());
+    }
+
+    /**
+     * Gate for the paid Apify scanners (Instagram/Reddit): active AND the relevance check has
+     * evaluated the movie from its cheap X posts without failing it. A movie that just entered its
+     * window waits (typically ~1-2h) for that first evaluation, so a junk title is excluded before
+     * any Apify run is spent on it. An admin-restored movie (relevance_override) is always eligible.
+     */
+    public static boolean isApifyEligible(String entity) {
+        String sql = "SELECT relevance_override OR relevance_checked_at IS NOT NULL FROM tracked_releases " +
+                "WHERE entity_name = ? AND NOT excluded AND ? BETWEEN track_from AND track_until";
+        try (Connection conn = DatabaseService.getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, entity);
+            pstmt.setDate(2, Date.valueOf(today()));
+            try (ResultSet rs = pstmt.executeQuery()) {
+                return rs.next() && rs.getBoolean(1);
+            }
+        } catch (SQLException e) {
+            // Fail closed here (unlike isActive): skipping one paid run is cheaper than paying for junk.
+            System.err.println("Database error checking Apify eligibility for '" + entity + "': " + e.getMessage());
+            return false;
+        }
     }
 
     static String autoExcludeReason(String language) {
