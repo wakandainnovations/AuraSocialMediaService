@@ -1,11 +1,6 @@
-{"entity": "GDN", "keyword": "GDN", "category": "media.movie", "language": "tamil"}
-{"entity": "GDN", "keyword": "GDNaidu", "category": "media.movie", "language": "tamil"}
-{"entity": "Jana Nayagan", "keyword": "Jananayagan", "category": "media.movie", "language": "tamil"}
-{"entity": "Jana Nayagan", "keyword": "Jana Nayagan", "category": "media.movie", "language": "tamil"}
+{"entity": "Thaytha", "keyword": "thaytha", "category": "media.movie", "language": "kannada"}
 {"entity": "Lord Gaaga", "keyword": "lordgaaga", "category": "media.movie", "language": "kannada"}
-{"entity": "Toxic", "keyword": "ToxicTheMovie", "category": "media.movie", "language": "kannada,hindi,telugu,tamil,malayalam,english"}
-{"entity": "Toxic", "keyword": "Toxic", "category": "media.movie", "language": "kannada,hindi,telugu,tamil,malayalam,english"}
-{"entity": "Ayogya 2", "keyword": "Ayogya2", "category": "media.movie", "language": "kannada"}
-{"entity": "Shreemati Sindoora", "keyword": "ShreematiSindoora", "category": "media.movie", "language": "kannada"}
-{"entity": "Tadviruddha", "keyword": "Tadviruddha", "category": "media.movie", "language": "kannada"}
+{"entity": "Mr Lucky", "keyword": "mrlucky", "category": "media.movie", "language": "kannada"}
+{"entity": "Appu Garage", "keyword": "appugarage", "category": "media.movie", "language": "kannada"}
+{"entity": "Chandrahaasa", "keyword": "chandrahaasa", "category": "media.movie", "language": "kannada"}
 {"entity": "Tamma Sukhagamana Bayasuva", "keyword": "TammaSukhagamanaBayasuva", "category": "media.movie", "language": "kannada"}

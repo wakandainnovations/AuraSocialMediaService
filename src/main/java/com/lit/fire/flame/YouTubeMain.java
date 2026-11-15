@@ -36,7 +36,9 @@ public class YouTubeMain implements SocialMediaScanner {
     private static int numberOfComments;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
 
-    private static void loadConfig() throws Exception {
+    // Package-private (not private) so MovieBackfillService can populate API_KEY/numberOfComments
+    // before calling search(...) directly, without going through scan()'s scheduler setup.
+    static void loadConfig() throws Exception {
         Properties properties = new Properties();
         try (InputStream input = YouTubeMain.class.getClassLoader().getResourceAsStream("secrets.properties")) {
             if (input == null) {
@@ -81,12 +83,22 @@ public class YouTubeMain implements SocialMediaScanner {
      * mid-run, remaining videos fall back to YouTubeCommentsApifyService.
      */
     public static void search(String entity, List<String> keywords, String category) throws Exception {
+        search(entity, keywords, category, numberOfVideos, null);
+    }
+
+    /**
+     * Same as {@link #search(String, List, String)} but lets the caller override the video cap and
+     * restrict results to videos published on/after {@code publishedAfter}. Used by
+     * MovieBackfillService for a fixed-window historical run, which can't share the mutable
+     * {@code numberOfVideos} field with the regular scheduled scan.
+     */
+    public static void search(String entity, List<String> keywords, String category, int maxVideos, java.time.Instant publishedAfter) throws Exception {
         String combinedQuery = buildQuery(keywords);
-        System.out.println("\nRetrieving latest " + numberOfVideos + " videos for entity '" + entity
+        System.out.println("\nRetrieving latest " + maxVideos + " videos for entity '" + entity
                 + "' (keywords: " + String.join(", ", keywords) + ")...");
 
         YouTubeService service = new YouTubeService("YouTubeSearchApp", API_KEY);
-        List<SearchResult> videos = service.searchVideos(combinedQuery, numberOfVideos);
+        List<SearchResult> videos = service.searchVideos(combinedQuery, maxVideos, publishedAfter);
 
         if (videos.isEmpty()) {
             System.out.println("No videos found for entity: '" + entity + "'");

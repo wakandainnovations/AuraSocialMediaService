@@ -16,6 +16,7 @@ import com.google.api.services.youtube.model.VideoListResponse;
 
 import java.io.IOException;
 import java.security.GeneralSecurityException;
+import java.time.Instant;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -60,8 +61,18 @@ public class YouTubeService {
      * @return A list of SearchResult objects, or an empty list if no results are found or an error occurs.
      */
     public List<SearchResult> searchVideos(String queryTerm, long maxResults) {
+        return searchVideos(queryTerm, maxResults, null);
+    }
+
+    /**
+     * Same as {@link #searchVideos(String, long)} but restricts results to videos published on or
+     * after {@code publishedAfter} (e.g. for a fixed-window historical backfill). Null behaves
+     * exactly like the two-arg overload (no lower bound, YouTube's default relevance ranking).
+     */
+    public List<SearchResult> searchVideos(String queryTerm, long maxResults, Instant publishedAfter) {
         try {
-            System.out.println("Executing search for query: " + queryTerm);
+            System.out.println("Executing search for query: " + queryTerm
+                    + (publishedAfter != null ? " (published after " + publishedAfter + ")" : ""));
 
             // Create and configure the search request.
             YouTube.Search.List searchRequest = youtubeService.search()
@@ -72,6 +83,12 @@ public class YouTubeService {
             searchRequest.setQ(queryTerm);
             searchRequest.setType("video"); // Restrict results to videos only.
             searchRequest.setMaxResults(maxResults);
+            if (publishedAfter != null) {
+                searchRequest.setPublishedAfter(new com.google.api.client.util.DateTime(publishedAfter.toEpochMilli()));
+                // A fixed lower bound plus relevance ranking can miss older-in-window uploads that
+                // rank low on relevance; chronological order gives even coverage across the window.
+                searchRequest.setOrder("date");
+            }
 
             // Set the 'fields' parameter to optimize the response by requesting only the needed data.
             // This reduces payload size and processing time.
