@@ -35,4 +35,22 @@ public class RelevanceCheckServiceTest extends TestCase {
         assertTrue(RelevanceCheckService.isMovieRelated("டைட்டானிக் 🔥🔥", terms));
         assertFalse(RelevanceCheckService.isMovieRelated("Titanic wreck dive footage", terms));
     }
+
+    public void testRetweetsCollapseIntoTheOriginalTweet() {
+        java.util.List<String> posts = java.util.List.of(
+                "‼️ PR Ousmane SONKO « rencontre bouma dém ñou nii ma boul diokhagnatii😁…» 🇸🇳❤️🔥 https://t.co/Yv7seHNLEF",
+                "RT @LayeSeckSeckFCB: ‼️ PR Ousmane SONKO « rencontre bouma dém ñou nii ma boul diokhagnatii😁…» 🇸🇳❤️🔥 https://t",
+                "RT @someoneElse: ‼️ PR Ousmane SONKO « rencontre bouma dém ñou nii ma boul diokhagnatii😁…» 🇸🇳",
+                "#RevathySharma arrives at the press meet of #Bouma",
+                "RT @Chalachithram24: #RevathySharma arrives at the press meet of #Bouma and steals the spotlight with her char");
+        java.util.List<String> distinct = RelevanceCheckService.distinctPosts(posts);
+        assertEquals(2, distinct.size());
+        assertEquals(posts.get(0), distinct.get(0));
+    }
+
+    public void testDifferentPostsAreKept() {
+        // The RT collapses into its original; short posts (< 30 chars) are never merged by prefix.
+        assertEquals(4, RelevanceCheckService.distinctPosts(java.util.List.of(
+                "Itllu Arjuna FDFS response is fire", "Itllu Arjuna review: 4/5", "RT @a: Itllu Arjuna FDFS response is fire 🔥", "Ah 🔥", "Ah 🔥🔥")).size());
+    }
 }

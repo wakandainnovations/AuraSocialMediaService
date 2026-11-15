@@ -22,8 +22,9 @@ import java.util.regex.Pattern;
  * movie. Generic titles ("Titanic", "Ah", "Dark Chocolate") pull in mostly unrelated posts; on
  * 2026-11-16's data such titles scored 1-5% movie-related while real releases scored 45-100%.
  *
- * <p>For each active, non-excluded movie the score is the share of its X posts (plus YouTube video
- * titles) collected since its tracking window opened that carry movie context: film vocabulary
+ * <p>For each active, non-excluded movie the score is the share of its distinct X posts (plus
+ * YouTube video titles; retweets collapse into the tweet they copy, see {@link #distinctPosts})
+ * collected since its tracking window opened that carry movie context: film vocabulary
  * (movie, trailer, review, FDFS, theatre...), the language / film industry, the movie's own hashtags,
  * its native-script title, or its cast/director names (TMDB credits, {@code context_terms}).
  *
@@ -60,7 +61,7 @@ public class RelevanceCheckService implements SocialMediaScanner {
 
         int evaluated = 0, excluded = 0;
         for (Candidate c : activeCandidates(today)) {
-            List<String> texts = collectedTexts(c);
+            List<String> texts = distinctPosts(collectedTexts(c));
             if (texts.isEmpty() && !graceElapsed(c, graceHours)) continue;
             Set<String> terms = contextTerms(c);
             long relevant = texts.stream().filter(t -> isMovieRelated(t, terms)).count();
@@ -81,6 +82,48 @@ public class RelevanceCheckService implements SocialMediaScanner {
             evaluated++;
         }
         System.out.println("[Relevance] Checked " + evaluated + " movie(s), auto-excluded " + excluded + ".");
+    }
+
+    // Leading "RT @handle: " that X prepends to a retweet's text.
+    private static final Pattern RT_PREFIX = Pattern.compile("^\\s*rt\\s+@[\\w]+:\\s*", Pattern.CASE_INSENSITIVE);
+    private static final Pattern URL = Pattern.compile("https?://\\S*");
+    // Retweet text is truncated at varying lengths, so posts are compared by prefix (the shorter
+    // normalised text being the start of the longer), only above this length - very short posts
+    // ("Ah 🔥") are left alone rather than merged.
+    private static final int DEDUPE_MIN_CHARS = 30;
+    private static final int DEDUPE_MAX_CHARS = 200;
+
+    /**
+     * Counts each distinct post once: a retweet ("RT @user: <text…>") and the tweet it copies -
+     * or many retweets of one viral tweet - collapse to one. Texts are normalised (RT prefix,
+     * links, "…" dropped; case and whitespace folded), then a post whose normalised text starts
+     * the same as an already-kept one (one being a prefix of the other, as X truncates retweets
+     * at varying lengths) is treated as a copy. Keeps first-seen order; O(n²) on <= 500 posts.
+     */
+    static List<String> distinctPosts(List<String> texts) {
+        List<String> keptKeys = new ArrayList<>();
+        List<String> kept = new ArrayList<>();
+        for (String t : texts) {
+            if (t == null) continue;
+            String norm = URL.matcher(RT_PREFIX.matcher(t).replaceFirst("")).replaceAll(" ")
+                    .replace("…", " ").replaceAll("\\s+", " ").trim().toLowerCase(Locale.ROOT);
+            if (norm.isEmpty()) continue;
+            String key = norm.length() > DEDUPE_MAX_CHARS ? norm.substring(0, DEDUPE_MAX_CHARS) : norm;
+            boolean duplicate = false;
+            for (String k : keptKeys) {
+                String shorter = k.length() <= key.length() ? k : key;
+                String longer = shorter == k ? key : k;
+                if (shorter.equals(longer) || (shorter.length() >= DEDUPE_MIN_CHARS && longer.startsWith(shorter))) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                keptKeys.add(key);
+                kept.add(t);
+            }
+        }
+        return kept;
     }
 
     /** True when the text mentions any movie-context term (case-insensitive, word-ish match). */
