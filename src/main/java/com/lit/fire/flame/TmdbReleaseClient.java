@@ -41,9 +41,18 @@ public class TmdbReleaseClient {
             Map.entry("kok", "konkani"), Map.entry("tcy", "tulu"), Map.entry("ne", "nepali"),
             Map.entry("mai", "maithili"), Map.entry("raj", "rajasthani"));
 
-    /** {@code contextTerms}: lead cast + director names (TMDB credits), used by the relevance check. */
+    /**
+     * {@code contextTerms}: lead cast + director names (TMDB credits), used by the relevance check.
+     * {@code details}: genre/runtime/director/production company, copied onto the platform movie by
+     * AuraService's "Add to platform".
+     */
     public record Release(int tmdbId, String title, String originalTitle, String language,
-                          LocalDate releaseDate, Double popularity, String posterPath, List<String> contextTerms) {
+                          LocalDate releaseDate, Double popularity, String posterPath, List<String> contextTerms,
+                          Details details) {
+    }
+
+    /** Comma-separated genres and directors; runtime in minutes; first listed production company. */
+    public record Details(String genres, Integer runtime, String directors, String productionCompany) {
     }
 
     // How many top-billed cast members count as movie context for the relevance check.
@@ -148,7 +157,35 @@ public class TmdbReleaseClient {
         String language = code == null ? null : LANGUAGES.getOrDefault(code.toLowerCase(), code.toLowerCase());
         Double popularity = o.has("popularity") && !o.get("popularity").isJsonNull() ? o.get("popularity").getAsDouble() : null;
         return new Release(o.get("id").getAsInt(), title, str(o, "original_title"), language,
-                releaseDate, popularity, str(o, "poster_path"), creditNames(o));
+                releaseDate, popularity, str(o, "poster_path"), creditNames(o), details(o));
+    }
+
+    static Details details(JsonObject movie) {
+        List<String> genres = new ArrayList<>();
+        if (movie.has("genres") && movie.get("genres").isJsonArray()) {
+            for (JsonElement g : movie.getAsJsonArray("genres")) {
+                String n = str(g.getAsJsonObject(), "name");
+                if (n != null) genres.add(n);
+            }
+        }
+        Integer runtime = movie.has("runtime") && !movie.get("runtime").isJsonNull()
+                && movie.get("runtime").getAsInt() > 0 ? movie.get("runtime").getAsInt() : null;
+        List<String> directors = new ArrayList<>();
+        if (movie.has("credits") && movie.get("credits").isJsonObject()
+                && movie.getAsJsonObject("credits").has("crew")) {
+            for (JsonElement c : movie.getAsJsonObject("credits").getAsJsonArray("crew")) {
+                JsonObject m = c.getAsJsonObject();
+                String n = str(m, "name");
+                if (n != null && "Director".equals(str(m, "job")) && !directors.contains(n)) directors.add(n);
+            }
+        }
+        String company = null;
+        if (movie.has("production_companies") && movie.get("production_companies").isJsonArray()
+                && !movie.getAsJsonArray("production_companies").isEmpty()) {
+            company = str(movie.getAsJsonArray("production_companies").get(0).getAsJsonObject(), "name");
+        }
+        return new Details(genres.isEmpty() ? null : String.join(",", genres), runtime,
+                directors.isEmpty() ? null : String.join(", ", directors), company);
     }
 
     /** Top-billed cast and director(s) from an append_to_response=credits payload. */

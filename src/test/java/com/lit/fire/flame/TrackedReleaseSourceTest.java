@@ -79,4 +79,26 @@ public class TrackedReleaseSourceTest extends TestCase {
             assertFalse(l, TrackedReleaseSource.isIndianLanguage(l, auto));
         }
     }
+
+    public void testTmdbDetailsAreParsed() {
+        com.google.gson.JsonObject movie = com.google.gson.JsonParser.parseString("{"
+                + "\"genres\":[{\"name\":\"Action\"},{\"name\":\"Drama\"}],\"runtime\":142,"
+                + "\"production_companies\":[{\"name\":\"Mythri Movie Makers\"},{\"name\":\"Other\"}],"
+                + "\"credits\":{\"crew\":[{\"name\":\"A Director\",\"job\":\"Director\"},"
+                + "{\"name\":\"A Writer\",\"job\":\"Writer\"}]}}").getAsJsonObject();
+        TmdbReleaseClient.Details d = TmdbReleaseClient.details(movie);
+        assertEquals("Action,Drama", d.genres());
+        assertEquals(Integer.valueOf(142), d.runtime());
+        assertEquals("A Director", d.directors());
+        assertEquals("Mythri Movie Makers", d.productionCompany());
+    }
+
+    public void testMissingTmdbDetailsStayNull() {
+        TmdbReleaseClient.Details d = TmdbReleaseClient.details(
+                com.google.gson.JsonParser.parseString("{\"runtime\":0,\"genres\":[]}").getAsJsonObject());
+        assertNull(d.genres());
+        assertNull(d.runtime());
+        assertNull(d.directors());
+        assertNull(d.productionCompany());
+    }
 }

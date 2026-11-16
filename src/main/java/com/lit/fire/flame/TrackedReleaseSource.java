@@ -177,7 +177,10 @@ public class TrackedReleaseSource {
                 pstmt.setString(8, r.posterPath());
                 pstmt.setString(9, joinTerms(r.contextTerms()));
                 pstmt.setInt(10, r.tmdbId());
-                if (pstmt.executeUpdate() > 0) return false;
+                if (pstmt.executeUpdate() > 0) {
+                    saveDetails(conn, r);
+                    return false;
+                }
             }
 
             // Not tracked yet: only Indian-language releases are added at all. English / foreign-
@@ -211,8 +214,25 @@ public class TrackedReleaseSource {
                 pstmt.setString(13, autoExclude ? autoExcludeReason(r.language()) : null);
                 pstmt.setBoolean(14, autoExclude);
                 pstmt.setString(15, joinTerms(r.contextTerms()));
-                return pstmt.executeUpdate() > 0;
+                boolean inserted = pstmt.executeUpdate() > 0;
+                if (inserted) saveDetails(conn, r);
+                return inserted;
             }
+        }
+    }
+
+    /** TMDB-owned movie details, refreshed on every discovery pass (see V9). */
+    private static void saveDetails(Connection conn, TmdbReleaseClient.Release r) throws SQLException {
+        TmdbReleaseClient.Details d = r.details();
+        if (d == null) return;
+        try (PreparedStatement pstmt = conn.prepareStatement("UPDATE tracked_releases SET genres = ?, runtime = ?, "
+                + "director = ?, production_company = ? WHERE tmdb_id = ?")) {
+            pstmt.setString(1, d.genres());
+            if (d.runtime() == null) pstmt.setNull(2, java.sql.Types.INTEGER); else pstmt.setInt(2, d.runtime());
+            pstmt.setString(3, d.directors());
+            pstmt.setString(4, d.productionCompany());
+            pstmt.setInt(5, r.tmdbId());
+            pstmt.executeUpdate();
         }
     }
 
