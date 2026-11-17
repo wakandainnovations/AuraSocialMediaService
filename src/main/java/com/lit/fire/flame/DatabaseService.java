@@ -664,11 +664,13 @@ public class DatabaseService {
      *  - Tier A (created within last 2h): refresh up to once per hour, regardless of traction.
      *  - Tier B (older than 2h, has traction, within 7d): refresh once per 12h.
      *  - Tier C (older than 2h, no traction): excluded — never refreshed again.
-     * Each row gives both the composite DB id and the underlying X tweet id.
+     * Each row gives the composite DB id, the underlying X tweet id, the entity and created_at
+     * (epoch seconds). XApifyService needs the last two: it refreshes by re-running each entity's
+     * keyword search over the due tweets' id range, split by tier.
      */
     public static List<Map<String, String>> getXPostsDueForRefresh(int maxRows) {
         String sql =
-            "SELECT id, split_part(id, '_', 1) AS x_id " +
+            "SELECT id, split_part(id, '_', 1) AS x_id, entity, created_at " +
             "FROM x_posts " +
             "WHERE " +
             // Tier A — discovery window
@@ -682,6 +684,10 @@ public class DatabaseService {
             "   AND (likes_count + comment_count * " + COMMENT_WEIGHT + ") > " + TRACTION_THRESHOLD + " " +
             "   AND (last_refreshed_at IS NULL " +
             "        OR last_refreshed_at < NOW() - INTERVAL '12 hours')) " +
+            // With a per-cycle cap, pick Tier A (fresh posts) first, then whoever has waited longest,
+            // so no due post is starved by an arbitrary row order.
+            "ORDER BY (created_at > NOW() - INTERVAL '2 hours') DESC, " +
+            "         COALESCE(last_refreshed_at, created_at) ASC " +
             "LIMIT ?";
 
         List<Map<String, String>> rows = new ArrayList<>();
@@ -693,6 +699,11 @@ public class DatabaseService {
                     Map<String, String> row = new HashMap<>();
                     row.put("composite_id", rs.getString("id"));
                     row.put("x_id", rs.getString("x_id"));
+                    row.put("entity", rs.getString("entity"));
+                    Timestamp createdAt = rs.getTimestamp("created_at");
+                    if (createdAt != null) {
+                        row.put("created_at", String.valueOf(createdAt.toInstant().getEpochSecond()));
+                    }
                     rows.add(row);
                 }
             }
@@ -701,6 +712,31 @@ public class DatabaseService {
             e.printStackTrace();
         }
         return rows;
+    }
+
+    // Keywords previously stored for an entity's X posts (the `keyword` column holds the matched
+    // keywords comma-joined, or the entity name). Used to rebuild a refresh search for an entity that
+    // is no longer in the tracked-release list but still has posts due for a metrics refresh.
+    public static List<String> getXPostKeywords(String entity) {
+        String sql = "SELECT DISTINCT keyword FROM x_posts WHERE entity = ?";
+        java.util.LinkedHashSet<String> keywords = new java.util.LinkedHashSet<>();
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, entity);
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    String value = rs.getString("keyword");
+                    if (value == null) continue;
+                    for (String k : value.split(",")) {
+                        if (!k.trim().isEmpty()) keywords.add(k.trim());
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Database error in getXPostKeywords: " + e.getMessage());
+            e.printStackTrace();
+        }
+        return new ArrayList<>(keywords);
     }
 
     // Bumps last_refreshed_at on every candidate row, including those X dropped (deleted/private),

@@ -122,6 +122,7 @@ public class XService implements SocialMediaScanner {
                 }
                 throw e;
             }
+            recordSearchCost(entity, response);
 
             if (response != null && response.has("meta")) {
                 JsonObject meta = response.getAsJsonObject("meta");
@@ -188,6 +189,16 @@ public class XService implements SocialMediaScanner {
         }
     }
 
+    // Logs a successful recent-search request's billable reads (posts + expanded users) to x_cost_log.
+    private static void recordSearchCost(String entity, JsonObject response) {
+        int posts = response != null && response.has("data") ? response.getAsJsonArray("data").size() : 0;
+        int users = 0;
+        if (response != null && response.has("includes") && response.getAsJsonObject("includes").has("users")) {
+            users = response.getAsJsonObject("includes").getAsJsonArray("users").size();
+        }
+        XCostTracker.recordXApiRequest("poll", entity, posts, users);
+    }
+
     // Builds the OR'd recent-search query operator string for a set of keywords.
     private static String buildQuery(List<String> keywords) {
         return keywords.size() == 1 ? keywords.get(0) : "(" + String.join(" OR ", keywords) + ")";
@@ -222,7 +233,7 @@ public class XService implements SocialMediaScanner {
 
     // Returns the larger of two numeric snowflake id strings (compared by length, then lexically),
     // null-safe so it can fold across chunks.
-    private static String maxId(String a, String b) {
+    static String maxId(String a, String b) {
         if (a == null) return b;
         if (b == null) return a;
         if (a.length() != b.length()) return a.length() > b.length() ? a : b;
@@ -262,6 +273,8 @@ public class XService implements SocialMediaScanner {
                     API_URL, String.join(",", chunk));
 
             JsonObject resp = sendRequest(url);
+            XCostTracker.recordXApiRequest("refresh", null,
+                    resp != null && resp.has("data") ? resp.getAsJsonArray("data").size() : 0, 0);
             if (resp == null || !resp.has("data")) continue;
 
             for (JsonElement el : resp.getAsJsonArray("data")) {

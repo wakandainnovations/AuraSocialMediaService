@@ -85,4 +85,88 @@ public class ApifyClient {
         }
         return JsonParser.parseString(body).getAsJsonArray();
     }
+
+    /** Dataset items of a finished run, plus the run object (id, status, pricingInfo, chargedEventCounts). */
+    public record RunResult(JsonArray items, JsonObject run) {
+        public String runId() {
+            return run != null && run.has("id") ? run.get("id").getAsString() : null;
+        }
+    }
+
+    // How long runActor waits for a run to finish before aborting it.
+    private static final Duration RUN_DEADLINE = Duration.ofMinutes(15);
+
+    /**
+     * Like {@link #runActorAndGetDatasetItems} but starts the run asynchronously and waits for it,
+     * so the caller also gets the run object - its id and what Apify charged for it - which the
+     * synchronous endpoint doesn't return. Used where spend is tracked (XApifyService).
+     */
+    public static RunResult runActor(String actorId, JsonObject input) throws Exception {
+        String token = loadApiToken();
+        String encodedActorId = actorId.replace("/", "~");
+        HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
+
+        // waitForFinish is capped at 60s by the API; keep re-waiting on the run until it's done.
+        JsonObject run = sendJson(client, HttpRequest.newBuilder()
+                .uri(URI.create(API_BASE_URL + "/acts/" + encodedActorId + "/runs?waitForFinish=60"))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(input.toString(), StandardCharsets.UTF_8)), token, actorId);
+        long deadline = System.currentTimeMillis() + RUN_DEADLINE.toMillis();
+        while (isRunning(run)) {
+            if (System.currentTimeMillis() > deadline) {
+                String runId = run.get("id").getAsString();
+                try {
+                    sendJson(client, HttpRequest.newBuilder()
+                            .uri(URI.create(API_BASE_URL + "/actor-runs/" + runId + "/abort"))
+                            .POST(HttpRequest.BodyPublishers.noBody()), token, actorId);
+                } catch (Exception ignored) {
+                    // Best effort; the timeout below is what matters to the caller.
+                }
+                throw new RuntimeException("Apify Actor run " + runId + " for '" + actorId + "' did not finish within "
+                        + RUN_DEADLINE.toMinutes() + " minutes; aborted.");
+            }
+            run = sendJson(client, HttpRequest.newBuilder()
+                    .uri(URI.create(API_BASE_URL + "/actor-runs/" + run.get("id").getAsString() + "?waitForFinish=60"))
+                    .GET(), token, actorId);
+        }
+
+        String status = run.has("status") ? run.get("status").getAsString() : "UNKNOWN";
+        if (!status.equals("SUCCEEDED")) {
+            throw new RuntimeException("Apify Actor run " + run.get("id").getAsString() + " for '" + actorId
+                    + "' ended with status " + status);
+        }
+
+        HttpResponse<String> itemsResponse = client.send(HttpRequest.newBuilder()
+                .uri(URI.create(API_BASE_URL + "/datasets/" + run.get("defaultDatasetId").getAsString()
+                        + "/items?format=json&clean=true"))
+                .timeout(REQUEST_TIMEOUT)
+                .header("Authorization", "Bearer " + token)
+                .GET()
+                .build(), HttpResponse.BodyHandlers.ofString());
+        if (itemsResponse.statusCode() < 200 || itemsResponse.statusCode() >= 300) {
+            throw new RuntimeException("Reading dataset for Apify run " + run.get("id").getAsString() + " failed. Status: "
+                    + itemsResponse.statusCode() + ", Body: " + itemsResponse.body());
+        }
+        String body = itemsResponse.body();
+        JsonArray items = body == null || body.isBlank() ? new JsonArray() : JsonParser.parseString(body).getAsJsonArray();
+        return new RunResult(items, run);
+    }
+
+    private static boolean isRunning(JsonObject run) {
+        String status = run.has("status") ? run.get("status").getAsString() : "";
+        return status.equals("READY") || status.equals("RUNNING");
+    }
+
+    // Sends a request and returns the "data" object of Apify's JSON envelope.
+    private static JsonObject sendJson(HttpClient client, HttpRequest.Builder builder, String token, String actorId) throws Exception {
+        HttpResponse<String> response = client.send(builder
+                .timeout(Duration.ofSeconds(120))
+                .header("Authorization", "Bearer " + token)
+                .build(), HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() < 200 || response.statusCode() >= 300) {
+            throw new RuntimeException("Apify request for '" + actorId + "' failed. Status: " + response.statusCode()
+                    + ", Body: " + response.body());
+        }
+        return JsonParser.parseString(response.body()).getAsJsonObject().getAsJsonObject("data");
+    }
 }

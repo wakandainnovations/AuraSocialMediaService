@@ -58,6 +58,25 @@ public class Main {
         }
     }
 
+    // x.provider picks the X/Twitter source: "apify" (default, XApifyService - Apify's tweet scraper,
+    // much cheaper) or "api" (XService - the official X API v2, billed per post read). Only the
+    // chosen scanner is created, so the other one makes no calls at all.
+    private static SocialMediaScanner createXScanner() {
+        String provider = AppProperties.getProperty("x.provider");
+        provider = provider == null ? "apify" : provider.trim().toLowerCase();
+        switch (provider) {
+            case "api":
+                System.out.println("X provider: official X API v2 (XService).");
+                return new XService();
+            case "apify":
+                System.out.println("X provider: Apify tweet scraper (XApifyService).");
+                return new XApifyService();
+            default:
+                System.err.println("Unknown x.provider '" + provider + "'; using Apify (XApifyService).");
+                return new XApifyService();
+        }
+    }
+
     public static void main(String[] args) {
         // Populate tracked_releases before the scanners load it, so the very first pass already
         // covers every current release. A failure (e.g. TMDB down / no credential) isn't fatal:
@@ -93,7 +112,7 @@ public class Main {
         // not the native Graph API / Reddit OAuth clients (InstagramService/RedditAuthClientWithSearch).
         services.add(new ScannableService(new InstagramApifyService(), "Instagram", APIFY_SUCCESS_DELAY_MS));
         services.add(new ScannableService(new RedditApifyService(), "Reddit", APIFY_SUCCESS_DELAY_MS));
-        services.add(new ScannableService(new XService(), "X"));
+        services.add(new ScannableService(createXScanner(), "X"));
         services.add(new ScannableService(new YouTubeMain(), "YouTube"));
 
         for (ScannableService service : services) {

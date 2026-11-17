@@ -14,7 +14,7 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * Keeps one recurring poll per actively tracked entity on a scanner's scheduler (used by the
- * per-entity scheduled scanners XService and YouTubeMain). The tracked list changes on its own
+ * per-entity scheduled scanners XService, XApifyService and YouTubeMain). The tracked list changes on its own
  * (movies enter/leave their ±7-day window, admins exclude movies or edit keywords), so each
  * {@link #sync} reconciles against {@link TrackedReleaseSource#loadInputQueries()}: new entities
  * are scheduled, entities no longer active are cancelled, and an entity whose keywords changed is
