@@ -257,6 +257,11 @@ public class RedditApifyService implements SocialMediaScanner {
 
     @Override
     public void scan() {
+        // Entities whose Actor run failed this pass. One failure no longer ends the pass for every
+        // entity after it; the failed entity keeps its old cursor (so nothing is skipped) and the
+        // pass moves on. Failures are re-thrown at the end so Main logs them and retries sooner,
+        // instead of the pass quietly "succeeding" and waiting the full 12h.
+        List<String> failedEntities = new ArrayList<>();
         try {
             numberOfPosts = AppProperties.getIntProperty("number.of.posts", 10);
             System.out.println("Initializing Reddit Apify Search...");
@@ -296,17 +301,30 @@ public class RedditApifyService implements SocialMediaScanner {
                 // Only ask the Actor for posts newer than this entity's last successful fetch, so a
                 // repeat scan isn't billed again for content already saved. First-ever fetch for an
                 // entity has no cursor yet and behaves like today (no lower bound).
-                Instant lastFetch = DatabaseService.getLastFetchTime(PLATFORM, entity);
-                Instant scanStart = Instant.now();
-                search(entity, keywords, category, numberOfPosts, lastFetch != null ? DATE_FORMATTER.format(lastFetch) : null, null);
-                DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
+                try {
+                    Instant lastFetch = DatabaseService.getLastFetchTime(PLATFORM, entity);
+                    Instant scanStart = Instant.now();
+                    search(entity, keywords, category, numberOfPosts, lastFetch != null ? DATE_FORMATTER.format(lastFetch) : null, null);
+                    DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
+                } catch (Exception e) {
+                    failedEntities.add(entity);
+                    System.err.println("[Apify/Reddit] Scan failed for '" + entity + "' (cursor left unchanged): " + e);
+                    e.printStackTrace();
+                    continue; // nothing was collected, so don't spend the hour's spacing on it
+                }
 
                 System.out.println(System.currentTimeMillis() + ": Waiting 60 minutes before the next entity...");
                 Thread.sleep(ENTITY_DELAY_MS);
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Reddit Apify scan interrupted", e);
         } catch (Exception e) {
-            System.err.println("An unrecoverable error occurred during the Reddit Apify scan.");
-            e.printStackTrace();
+            throw new RuntimeException("Reddit Apify scan failed: " + e.getMessage(), e);
+        }
+        if (!failedEntities.isEmpty()) {
+            throw new RuntimeException("Reddit Apify scan failed for " + failedEntities.size() + " entit"
+                    + (failedEntities.size() == 1 ? "y" : "ies") + ": " + failedEntities);
         }
     }
 }

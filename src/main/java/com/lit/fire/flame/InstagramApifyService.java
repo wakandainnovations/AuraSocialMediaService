@@ -346,6 +346,11 @@ public class InstagramApifyService implements SocialMediaScanner {
 
     @Override
     public void scan() {
+        // Entities whose Actor run failed this pass. One failure no longer ends the pass for every
+        // entity after it; the failed entity keeps its old cursor and the pass moves on. Failures
+        // are re-thrown at the end so Main logs them and retries sooner, instead of the pass
+        // quietly "succeeding" and waiting the full 12h.
+        List<String> failedEntities = new ArrayList<>();
         try {
             numberOfPosts = AppProperties.getIntProperty("number.of.posts", 10);
             System.out.println("Initializing Instagram Apify Search...");
@@ -384,17 +389,30 @@ public class InstagramApifyService implements SocialMediaScanner {
                 // only avoids re-saving posts already stored under this entity's last fetch, it does
                 // not reduce what's billed for the call itself. Frequency (see Main.APIFY_SUCCESS_DELAY_MS)
                 // is the actual cost lever for this scanner.
-                Instant lastFetch = DatabaseService.getLastFetchTime(PLATFORM, entity);
-                Instant scanStart = Instant.now();
-                search(entity, keywords, category, numberOfPosts, lastFetch);
-                DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
+                try {
+                    Instant lastFetch = DatabaseService.getLastFetchTime(PLATFORM, entity);
+                    Instant scanStart = Instant.now();
+                    search(entity, keywords, category, numberOfPosts, lastFetch);
+                    DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
+                } catch (Exception e) {
+                    failedEntities.add(entity);
+                    System.err.println("[Apify/Instagram] Scan failed for '" + entity + "' (cursor left unchanged): " + e);
+                    e.printStackTrace();
+                    continue; // nothing was collected, so don't spend the hour's spacing on it
+                }
 
                 System.out.println(System.currentTimeMillis() + ": Waiting 60 minutes before the next entity...");
                 Thread.sleep(ENTITY_DELAY_MS);
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("Instagram Apify scan interrupted", e);
         } catch (Exception e) {
-            System.err.println("An unrecoverable error occurred during the Instagram Apify scan.");
-            e.printStackTrace();
+            throw new RuntimeException("Instagram Apify scan failed: " + e.getMessage(), e);
+        }
+        if (!failedEntities.isEmpty()) {
+            throw new RuntimeException("Instagram Apify scan failed for " + failedEntities.size() + " entit"
+                    + (failedEntities.size() == 1 ? "y" : "ies") + ": " + failedEntities);
         }
     }
 }
