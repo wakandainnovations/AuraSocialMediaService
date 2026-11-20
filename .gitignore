@@ -47,3 +47,10 @@ build/
 
 ### Runtime logs ###
 logs/
+
+### Weekly release files (ReleaseDiscoveryService) ###
+releases/
+
+### Python ###
+__pycache__/
+.venv/

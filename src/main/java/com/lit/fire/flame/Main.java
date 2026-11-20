@@ -12,7 +12,8 @@ public class Main {
     // already takes ~7-8 hours; waiting another 12 hours after it completes keeps full-cycle cost
     // down (~19-20h cadence) instead of restarting an already-hours-long pass every hour.
     private static final long APIFY_SUCCESS_DELAY_MS = 12 * 60 * 60 * 1000; // 12 hours
-    // TMDB release discovery (ReleaseDiscoveryService) - release dates move slowly, twice a day is plenty.
+    // TMDB release discovery (ReleaseDiscoveryService, writes the weekly release file) - release
+    // dates move slowly, twice a day is plenty.
     private static final long DISCOVERY_SUCCESS_DELAY_MS = 12 * 60 * 60 * 1000; // 12 hours
 
     private static class ScannableService implements Runnable {
@@ -78,10 +79,10 @@ public class Main {
     }
 
     public static void main(String[] args) {
-        // Populate tracked_releases before the scanners load it, so the very first pass already
-        // covers every current release. A failure (e.g. TMDB down / no credential) isn't fatal:
-        // scanners still work off whatever is already in the table, and the scheduled discovery
-        // below retries.
+        // Write this week's release file (releases/releases-YYYY-Www.json). The service doesn't
+        // load it into tracked_releases - the standalone scripts/release_file_listener.py does -
+        // so scanners work off whatever is in the table. A failure (e.g. TMDB down / no
+        // credential) isn't fatal; the scheduled discovery below retries.
         ReleaseDiscoveryService discovery = new ReleaseDiscoveryService();
         try {
             discovery.scan();

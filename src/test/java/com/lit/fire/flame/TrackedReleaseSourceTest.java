@@ -6,28 +6,6 @@ import java.util.List;
 
 public class TrackedReleaseSourceTest extends TestCase {
 
-    public void testMultiWordTitleGetsHashtagAndPhrase() {
-        assertEquals("MrLucky,Mr. Lucky", TrackedReleaseSource.defaultKeywords("Mr. Lucky", "Mr. Lucky"));
-    }
-
-    public void testSingleWordTitleGetsOneKeyword() {
-        assertEquals("Chandrahaasa", TrackedReleaseSource.defaultKeywords("Chandrahaasa", null));
-    }
-
-    public void testNonLatinOriginalTitleIsSkipped() {
-        assertEquals("JanaNayagan,Jana Nayagan", TrackedReleaseSource.defaultKeywords("Jana Nayagan", "ஜன நாயகன்"));
-    }
-
-    public void testDistinctLatinOriginalTitleIsAdded() {
-        assertEquals("Toxic,ToxicAFairyTale,Toxic A Fairy Tale",
-                TrackedReleaseSource.defaultKeywords("Toxic", "Toxic: A Fairy Tale"));
-    }
-
-    public void testCommaInTitleNeverSplitsIntoTwoKeywords() {
-        String kw = TrackedReleaseSource.defaultKeywords("Hello, World", null);
-        assertEquals(List.of("HelloWorld", "Hello World"), TrackedReleaseSource.splitKeywords(kw));
-    }
-
     public void testSplitKeywordsTrimsAndDropsBlanks() {
         assertEquals(List.of("a", "b c"), TrackedReleaseSource.splitKeywords(" a, ,b c ,"));
     }
