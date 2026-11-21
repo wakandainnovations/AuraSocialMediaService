@@ -263,12 +263,12 @@ public class RedditApifyService implements SocialMediaScanner {
         entitySchedule.sync(scheduler, RedditApifyService::poll);
     }
 
-    // One entity's scheduled poll. Returns how many posts newer than the last fetch came back, or SKIPPED.
-    private static int poll(String entity, List<String> keywords, String category, Instant previousPollAt) throws Exception {
+    // One entity's scheduled poll: how many posts newer than the last fetch came back, or SKIPPED.
+    private static TrackedEntityScheduler.PollResult poll(String entity, List<String> keywords, String category, Instant previousPollAt) throws Exception {
         // Paid run: wait until the relevance check has cleared this movie from its X posts.
         if (!TrackedReleaseSource.isApifyEligible(entity)) {
             System.out.println("[Apify/Reddit] Skipping '" + entity + "' (awaiting relevance check).");
-            return TrackedEntityScheduler.SKIPPED;
+            return TrackedEntityScheduler.PollResult.SKIPPED;
         }
         // Only ask the Actor for posts since this entity's last successful fetch, so a repeat scan
         // isn't billed again for content already saved. First-ever fetch has no lower bound. On
@@ -280,12 +280,12 @@ public class RedditApifyService implements SocialMediaScanner {
         DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
         // dateFrom is day-granular, so the run also returns earlier posts from that day; only
         // posts after the last fetch count towards this movie's activity.
-        if (lastFetch == null) return posts.size();
+        if (lastFetch == null) return TrackedEntityScheduler.PollResult.of(posts.size());
         int newPosts = 0;
         for (JsonElement el : posts) {
             JsonObject post = el.getAsJsonObject();
             if (post.has("created_utc") && post.get("created_utc").getAsLong() >= lastFetch.getEpochSecond()) newPosts++;
         }
-        return newPosts;
+        return TrackedEntityScheduler.PollResult.of(newPosts);
     }
 }

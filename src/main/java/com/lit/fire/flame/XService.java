@@ -382,6 +382,7 @@ public class XService implements SocialMediaScanner {
         // entity (TrackedEntityScheduler: 4h, backing off to 24h when quiet), with its keywords
         // combined into one OR'd query so a shared tweet is read once; initial starts are staggered
         // over 0-5 min to avoid hitting X rate limits at once.
-        entitySchedule.sync(scheduler, (entity, keywords, category, previousPollAt) -> search(entity, keywords, category));
+        entitySchedule.sync(scheduler, (entity, keywords, category, previousPollAt) ->
+                TrackedEntityScheduler.PollResult.of(search(entity, keywords, category)));
     }
 }

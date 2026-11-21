@@ -37,12 +37,12 @@ public class TrackedReleaseSource {
 
     /**
      * Active rows in the same one-object-per-keyword shape search_queries.txt produced
-     * ({entity, keyword, category, language}), so the scanners' existing group-by-entity loops are
+     * ({entity, keyword, category, language, release_date when known}), so the scanners' existing group-by-entity loops are
      * unchanged. Ordered by release date so the soonest/just-released movies are scanned first.
      */
     public static List<JsonObject> loadInputQueries() {
         List<JsonObject> result = new ArrayList<>();
-        String sql = "SELECT entity_name, keywords, category, language FROM tracked_releases " +
+        String sql = "SELECT entity_name, keywords, category, language, release_date FROM tracked_releases " +
                 "WHERE NOT excluded AND ? BETWEEN track_from AND track_until " +
                 "ORDER BY release_date, entity_name";
         try (Connection conn = DatabaseService.getConnection();
@@ -51,12 +51,14 @@ public class TrackedReleaseSource {
             try (ResultSet rs = pstmt.executeQuery()) {
                 while (rs.next()) {
                     String entity = rs.getString("entity_name");
+                    Date releaseDate = rs.getDate("release_date");
                     for (String keyword : splitKeywords(rs.getString("keywords"))) {
                         JsonObject row = new JsonObject();
                         row.addProperty("entity", entity);
                         row.addProperty("keyword", keyword);
                         row.addProperty("category", rs.getString("category"));
                         row.addProperty("language", rs.getString("language"));
+                        if (releaseDate != null) row.addProperty("release_date", releaseDate.toLocalDate().toString());
                         result.add(row);
                     }
                 }

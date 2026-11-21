@@ -12,10 +12,13 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -34,7 +37,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *       (split into chunks past {@link #MAX_QUERY_CHARS}, as XService does) plus
  *       {@code since_id:<last saved tweet id>}, so only tweets newer than the last one seen are
  *       fetched. The since_id lives in the same x_post_ids row XService uses, so switching
- *       x.provider either way resumes from the same tweet.</li>
+ *       x.provider either way resumes from the same tweet. Movies due within the same window share
+ *       searches ({@link #pollDue}): several movies' keywords in one query, each tweet saved under
+ *       the movies whose keywords its text contains.</li>
  *   <li><b>Likes / replies / views refresh</b>: hourly, using the same tiered candidate set and the
  *       same 100-posts-per-cycle cap as XService.refreshMetrics. Instead of a per-tweet lookup (the
  *       Actor bills $0.05 per tweet URL), due tweets are grouped per entity into short time slices
@@ -62,6 +67,8 @@ public class XApifyService implements SocialMediaScanner {
     private static final Object SCAN_ACTOR_LOCK = new Object();
     // Same cap XService uses, so keyword chunking (and therefore query count) matches it.
     private static final int MAX_QUERY_CHARS = 512;
+    // A shared search's keyword part, leaving room for " since_id:<19-digit id>".
+    private static final int SHARED_QUERY_CHARS = MAX_QUERY_CHARS - 30;
     // Tier A / Tier B boundary in DatabaseService.getXPostsDueForRefresh's policy.
     private static final long TIER_A_MAX_AGE_SECONDS = 2 * 60 * 60;
     // Each query's fee already covers ~40 tweets, so never ask for fewer.
@@ -98,11 +105,172 @@ public class XApifyService implements SocialMediaScanner {
     // ---------------------------------------------------------------------------------------------
 
     /**
+     * Scheduled poll for every entity due together (TrackedEntityScheduler.BatchTask). Entities that
+     * already have a saved tweet id are packed into shared searches: their keywords OR'd into one
+     * query of at most {@link #MAX_QUERY_CHARS}, bounded by the oldest member's since_id, and each
+     * returned tweet is saved under every member whose keywords it contains. A first poll (no
+     * since_id yet) or a keyword list too long to share a query is polled on its own.
+     */
+    static Map<String, TrackedEntityScheduler.PollResult> pollDue(List<TrackedEntityScheduler.Due> due) {
+        Map<String, TrackedEntityScheduler.PollResult> results = new LinkedHashMap<>();
+        List<Member> shareable = new ArrayList<>();
+        for (TrackedEntityScheduler.Due d : due) {
+            String sinceId = validSinceId(DatabaseService.getLastXPostId(d.entity()));
+            List<String> keywords = distinct(d.keywords());
+            if (sinceId == null || coreQuery(keywords).length() > SHARED_QUERY_CHARS || due.size() == 1) {
+                try {
+                    results.put(d.entity(), poll(d.entity(), d.keywords(), d.category()));
+                } catch (Exception e) {
+                    System.err.println("[Apify/X] Poll failed for '" + d.entity() + "': " + e.getMessage());
+                    results.put(d.entity(), TrackedEntityScheduler.PollResult.FAILED);
+                }
+                continue;
+            }
+            shareable.add(new Member(d.entity(), keywords, d.category(), sinceId));
+        }
+        for (List<Member> group : packMembers(shareable)) {
+            try {
+                results.putAll(group.size() == 1
+                        ? Map.of(group.get(0).entity(), poll(group.get(0).entity(), group.get(0).keywords(), group.get(0).category()))
+                        : pollGroup(group));
+            } catch (Exception e) {
+                System.err.println("[Apify/X] Shared poll failed for " + group.stream().map(Member::entity).toList() + ": " + e.getMessage());
+                for (Member m : group) results.put(m.entity(), TrackedEntityScheduler.PollResult.FAILED);
+            }
+        }
+        return results;
+    }
+
+    // An entity in a shared search, with its last saved tweet id.
+    record Member(String entity, List<String> keywords, String category, String sinceId) {
+    }
+
+    /**
+     * Greedily packs members into shared searches, newest since_id first, so members with similar
+     * since_ids share a query: a query is bounded by its oldest member's since_id, and every tweet
+     * the newer members already have between the two is billed again. A group is closed when the
+     * next member's keywords don't fit in the query or its since_id is more than
+     * {@code x.apify.batch.max_since_gap_hours} older than the group's newest.
+     */
+    static List<List<Member>> packMembers(List<Member> members) {
+        long maxGapMs = AppProperties.getIntProperty("x.apify.batch.max_since_gap_hours", 6) * 3600_000L;
+        List<Member> sorted = new ArrayList<>(members);
+        sorted.sort((a, b) -> compareIds(b.sinceId(), a.sinceId()));
+        List<List<Member>> groups = new ArrayList<>();
+        List<Member> current = new ArrayList<>();
+        Set<String> currentKeywords = new LinkedHashSet<>();
+        for (Member m : sorted) {
+            Set<String> candidate = new LinkedHashSet<>(currentKeywords);
+            candidate.addAll(m.keywords());
+            boolean fits = coreQuery(new ArrayList<>(candidate)).length() <= SHARED_QUERY_CHARS;
+            boolean close = current.isEmpty()
+                    || tweetTimeMs(current.get(0).sinceId()) - tweetTimeMs(m.sinceId()) <= maxGapMs;
+            if (!current.isEmpty() && (!fits || !close)) {
+                groups.add(current);
+                current = new ArrayList<>();
+                candidate = new LinkedHashSet<>(m.keywords());
+            }
+            current.add(m);
+            currentKeywords = candidate;
+        }
+        if (!current.isEmpty()) groups.add(current);
+        return groups;
+    }
+
+    private static Map<String, TrackedEntityScheduler.PollResult> pollGroup(List<Member> group) throws Exception {
+        Set<String> allKeywords = new LinkedHashSet<>();
+        String oldestSinceId = null;
+        for (Member m : group) {
+            allKeywords.addAll(m.keywords());
+            oldestSinceId = oldestSinceId == null || compareIds(m.sinceId(), oldestSinceId) < 0 ? m.sinceId() : oldestSinceId;
+        }
+        String label = String.join(", ", group.stream().map(Member::entity).toList());
+        System.out.println("\n[Apify/X] Shared search for " + group.size() + " entities: " + label);
+        String query = coreQuery(new ArrayList<>(allKeywords)) + " since_id:" + oldestSinceId;
+        JsonArray items = runScanActor("poll", label, query, numberOfPosts);
+        boolean capped = items.size() >= numberOfPosts;
+
+        List<JsonObject> tweets = new ArrayList<>();
+        String newestReturned = null;
+        for (JsonElement el : items) {
+            JsonObject post = toXPost(el.getAsJsonObject());
+            if (post == null) continue;
+            tweets.add(post);
+            newestReturned = XService.maxId(newestReturned, post.get("id").getAsString());
+        }
+
+        Map<String, TrackedEntityScheduler.PollResult> results = new LinkedHashMap<>();
+        Set<String> matchedIds = new HashSet<>();
+        for (Member m : group) {
+            JsonArray posts = new JsonArray();
+            for (JsonObject post : tweets) {
+                String id = post.get("id").getAsString();
+                if (compareIds(id, m.sinceId()) <= 0 || !mentionsAny(post.get("text").getAsString(), m.keywords())) continue;
+                posts.add(post);
+                matchedIds.add(id);
+            }
+            if (posts.size() > 0) {
+                DatabaseService.saveXPosts(posts, m.entity(), m.keywords(), m.category());
+            }
+            // The search covered every member's keywords up to the newest tweet it returned, so each
+            // member resumes from there - a quiet member doesn't hold every shared query back.
+            if (newestReturned != null && compareIds(newestReturned, m.sinceId()) > 0) {
+                DatabaseService.saveLastXPostId(m.entity(), newestReturned);
+            }
+            System.out.println("[Apify/X] '" + m.entity() + "': " + posts.size() + " new tweet(s) from the shared search.");
+            results.put(m.entity(), TrackedEntityScheduler.PollResult.of(posts.size(), capped));
+        }
+        long unmatched = tweets.stream().filter(t -> !matchedIds.contains(t.get("id").getAsString())).count();
+        if (unmatched > 0) {
+            System.out.println("[Apify/X] " + unmatched + " tweet(s) matched no movie's keywords in their text; dropped.");
+        }
+        return results;
+    }
+
+    /**
+     * Whether the tweet text contains one of the keywords: case-insensitive, ignoring '#' and
+     * quotes, and for a multi-word keyword every word anywhere in the text (as X's own search
+     * treats an unquoted multi-word term).
+     */
+    static boolean mentionsAny(String text, List<String> keywords) {
+        if (text == null) return false;
+        String lower = text.toLowerCase(Locale.ROOT);
+        for (String keyword : keywords) {
+            String[] words = keyword.toLowerCase(Locale.ROOT).replace("#", "").replace("\"", "").trim().split("\\s+");
+            boolean all = words.length > 0 && !words[0].isEmpty();
+            for (String w : words) {
+                if (!lower.contains(w)) {
+                    all = false;
+                    break;
+                }
+            }
+            if (all) return true;
+        }
+        return false;
+    }
+
+    // Milliseconds since the epoch encoded in a tweet (snowflake) id.
+    private static long tweetTimeMs(String id) {
+        return new BigInteger(id).shiftRight(22).longValue() + 1288834974657L;
+    }
+
+    private static String validSinceId(String id) {
+        if (id == null) return null;
+        id = id.trim();
+        return id.isEmpty() || id.equalsIgnoreCase("null") || !id.chars().allMatch(Character::isDigit) ? null : id;
+    }
+
+    private static List<String> distinct(List<String> keywords) {
+        return new ArrayList<>(new LinkedHashSet<>(keywords));
+    }
+
+    /**
      * Polls one entity for tweets newer than its last saved tweet id (XService.search's equivalent).
      * With no saved id yet (first poll), fetches the latest {@code numberOfPosts} with no lower bound,
-     * as XService does. The since_id is only advanced after every chunk has been saved.
+     * as XService does. The since_id is only advanced after every chunk has been saved. The result
+     * is "capped" when a chunk returned the full {@code numberOfPosts}.
      */
-    public static int poll(String entity, List<String> keywords, String category) throws Exception {
+    static TrackedEntityScheduler.PollResult poll(String entity, List<String> keywords, String category) throws Exception {
         String lastPostId = DatabaseService.getLastXPostId(entity);
         boolean hasSinceId = lastPostId != null && !lastPostId.trim().isEmpty()
                 && !lastPostId.equalsIgnoreCase("null");
@@ -112,9 +280,11 @@ public class XApifyService implements SocialMediaScanner {
 
         String maxNewestId = null;
         int newPosts = 0;
+        boolean capped = false;
         for (List<String> chunk : XService.chunkKeywords(keywords, MAX_QUERY_CHARS)) {
             String query = coreQuery(chunk) + (hasSinceId ? " since_id:" + lastPostId.trim() : "");
             JsonArray items = runScanActor("poll", entity, query, numberOfPosts);
+            capped |= items.size() >= numberOfPosts;
 
             JsonArray posts = new JsonArray();
             for (JsonElement el : items) {
@@ -139,7 +309,7 @@ public class XApifyService implements SocialMediaScanner {
         if (maxNewestId != null) {
             DatabaseService.saveLastXPostId(entity, maxNewestId);
         }
-        return newPosts;
+        return TrackedEntityScheduler.PollResult.of(newPosts, capped);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -332,7 +502,7 @@ public class XApifyService implements SocialMediaScanner {
         }
         // Not gated on TrackedReleaseSource.isApifyEligible: RelevanceCheckService needs these X
         // posts to make that decision in the first place.
-        entitySchedule.sync(scheduler, (entity, keywords, category, previousPollAt) -> poll(entity, keywords, category));
+        entitySchedule.sync(scheduler, XApifyService::pollDue);
     }
 
     // ---------------------------------------------------------------------------------------------

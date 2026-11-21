@@ -353,12 +353,12 @@ public class InstagramApifyService implements SocialMediaScanner {
         entitySchedule.sync(scheduler, InstagramApifyService::poll);
     }
 
-    // One entity's scheduled poll. Returns how many new posts were saved, or SKIPPED.
-    private static int poll(String entity, List<String> keywords, String category, Instant previousPollAt) throws Exception {
+    // One entity's scheduled poll: how many new posts were saved, or SKIPPED.
+    private static TrackedEntityScheduler.PollResult poll(String entity, List<String> keywords, String category, Instant previousPollAt) throws Exception {
         // Paid run: wait until the relevance check has cleared this movie from its X posts.
         if (!TrackedReleaseSource.isApifyEligible(entity)) {
             System.out.println("[Apify/Instagram] Skipping '" + entity + "' (awaiting relevance check).");
-            return TrackedEntityScheduler.SKIPPED;
+            return TrackedEntityScheduler.PollResult.SKIPPED;
         }
         System.out.println("[Apify/Instagram] Processing entity: " + entity + " -> keywords " + keywords);
         // This Actor has no server-side date filter, so it always returns (and bills) up to
@@ -369,6 +369,6 @@ public class InstagramApifyService implements SocialMediaScanner {
         Instant scanStart = Instant.now();
         int saved = search(entity, keywords, category, numberOfPosts, lastFetch);
         DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
-        return saved;
+        return TrackedEntityScheduler.PollResult.of(saved);
     }
 }

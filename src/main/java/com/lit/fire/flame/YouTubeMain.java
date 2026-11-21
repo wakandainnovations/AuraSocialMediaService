@@ -254,13 +254,13 @@ public class YouTubeMain implements SocialMediaScanner {
             // read/stored once.
             entitySchedule.sync(scheduler, (entity, keywords, category, previousPollAt) -> {
                 try {
-                    return search(entity, keywords, category, numberOfVideos, null, previousPollAt);
+                    return TrackedEntityScheduler.PollResult.of(search(entity, keywords, category, numberOfVideos, null, previousPollAt));
                 } catch (GoogleJsonResponseException e) {
                     if (e.getDetails() != null && e.getDetails().getCode() == 403
                             && e.getDetails().getMessage() != null && e.getDetails().getMessage().contains("quota")) {
                         System.err.println("YouTube API quota exceeded. Shutting down all tasks.");
                         scheduler.shutdown();
-                        return TrackedEntityScheduler.SKIPPED;
+                        return TrackedEntityScheduler.PollResult.SKIPPED;
                     }
                     throw e; // logged by the scheduler, retried after the base interval
                 }

@@ -2,12 +2,19 @@ package com.lit.fire.flame;
 
 import com.google.gson.JsonObject;
 
+import java.time.DayOfWeek;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -24,14 +31,25 @@ import java.util.concurrent.TimeUnit;
  *   <li>A quiet poll (fewer than {@code polling.busy.min_new_items} new items) doubles its
  *       interval, up to {@code polling.max.interval.hours} (default 24h). Paid scrapers charge per
  *       run whatever they find, so quiet movies are polled less.</li>
+ *   <li>A poll that hit the scraper's result cap ({@link PollResult#capped}, e.g. X's
+ *       x.apify.max_items) also backs off: such polls are the most expensive ones.</li>
  *   <li>A busy poll resets it to the base interval.</li>
+ *   <li>On {@code polling.daily.days} (default Monday-Thursday, IST) other than the movie's own
+ *       release date, the movie is polled once every {@code polling.daily.interval.hours} (24h)
+ *       instead - but never past the start (IST midnight) of its next non-daily day, so Friday and
+ *       release-day polling begins on time.</li>
  *   <li>A failed poll keeps the interval and retries after the base interval.</li>
- *   <li>A skipped poll ({@link #SKIPPED}, e.g. awaiting the relevance check; costs nothing)
- *       re-checks after {@code polling.skip.retry.minutes} (default 60).</li>
+ *   <li>A skipped poll ({@link PollResult#SKIPPED}, e.g. awaiting the relevance check; costs
+ *       nothing) re-checks after {@code polling.skip.retry.minutes} (default 60).</li>
  * </ul>
  *
+ * <p>A scanner that can poll several entities in one paid call (XApifyService) syncs with a
+ * {@link BatchTask}: when one entity's poll fires, every other entity due within
+ * {@code polling.batch.window.minutes} is handed to the same call, and each entity's schedule then
+ * continues from that shared poll.
+ *
  * <p>The tracked list changes on its own (movies enter/leave their ±7-day window, admins exclude
- * movies or edit keywords), so each {@link #sync} reconciles against
+ * movies or edit keywords), so each {@code sync} reconciles against
  * {@link TrackedReleaseSource#loadInputQueries()}: new entities are scheduled, entities no longer
  * active are cancelled, and an entity whose keywords changed is rescheduled (its interval resets).
  * An entity already scheduled with the same keywords is left alone, so calling sync repeatedly
@@ -40,17 +58,45 @@ import java.util.concurrent.TimeUnit;
  */
 class TrackedEntityScheduler {
 
-    /** Returned by a task that deliberately didn't poll (nothing was spent). */
-    static final int SKIPPED = -1;
+    /** What one entity's poll found. */
+    record PollResult(int newItems, boolean capped, boolean skipped, boolean failed) {
+        /** The task deliberately didn't poll (nothing was spent). */
+        static final PollResult SKIPPED = new PollResult(0, false, true, false);
+        /** The poll failed; retried after the base interval. */
+        static final PollResult FAILED = new PollResult(0, false, false, true);
+
+        static PollResult of(int newItems) {
+            return new PollResult(newItems, false, false, false);
+        }
+
+        static PollResult of(int newItems, boolean capped) {
+            return new PollResult(newItems, capped, false, false);
+        }
+    }
+
+    /** One entity handed to a poll. {@code previousPollAt} is null on the first poll since startup. */
+    record Due(String entity, List<String> keywords, String category, Instant previousPollAt) {
+    }
 
     interface EntityTask {
         /**
-         * Polls one entity and returns how many new items it found, or {@link #SKIPPED}.
-         * {@code previousPollAt} is when this entity's last completed poll started (null on the
-         * first poll since startup); tasks without their own cursor use it to tell new from old.
+         * Polls one entity. {@code previousPollAt} is when this entity's last completed poll
+         * started (null on the first poll since startup); tasks without their own cursor use it to
+         * tell new from old.
          */
-        int run(String entity, List<String> keywords, String category, Instant previousPollAt) throws Exception;
+        PollResult run(String entity, List<String> keywords, String category, Instant previousPollAt) throws Exception;
     }
+
+    interface BatchTask {
+        /**
+         * Polls the given entities (the first is the one whose timer fired) and returns a result for
+         * each one it polled. An entity missing from the result keeps its own schedule.
+         */
+        Map<String, PollResult> run(List<Due> due) throws Exception;
+    }
+
+    private static final Set<DayOfWeek> DEFAULT_DAILY_DAYS =
+            EnumSet.of(DayOfWeek.MONDAY, DayOfWeek.TUESDAY, DayOfWeek.WEDNESDAY, DayOfWeek.THURSDAY);
 
     private final String label;
     private final long maxInitialDelaySeconds;
@@ -58,6 +104,9 @@ class TrackedEntityScheduler {
     private final long maxIntervalSeconds;
     private final long skipRetrySeconds;
     private final int busyMinNewItems;
+    private final Set<DayOfWeek> dailyDays;
+    private final long dailyIntervalSeconds;
+    private final long batchWindowSeconds;
     private final Map<String, EntityPoll> scheduled = new HashMap<>();
 
     TrackedEntityScheduler(String label, long maxInitialDelaySeconds) {
@@ -68,9 +117,25 @@ class TrackedEntityScheduler {
                 AppProperties.getIntProperty("polling.max.interval.hours", 24) * 3600L);
         this.skipRetrySeconds = Math.max(1, AppProperties.getIntProperty("polling.skip.retry.minutes", 60)) * 60L;
         this.busyMinNewItems = Math.max(1, AppProperties.getIntProperty("polling.busy.min_new_items", 10));
+        this.dailyDays = parseDays(AppProperties.getProperty("polling.daily.days"));
+        this.dailyIntervalSeconds = Math.max(1, AppProperties.getIntProperty("polling.daily.interval.hours", 24)) * 3600L;
+        this.batchWindowSeconds = Math.max(0, AppProperties.getIntProperty("polling.batch.window.minutes", 120)) * 60L;
     }
 
-    synchronized void sync(ScheduledExecutorService scheduler, EntityTask task) {
+    /** One entity per poll. */
+    void sync(ScheduledExecutorService scheduler, EntityTask task) {
+        sync(scheduler, due -> {
+            Due d = due.get(0);
+            return Map.of(d.entity(), task.run(d.entity(), d.keywords(), d.category(), d.previousPollAt()));
+        }, false);
+    }
+
+    /** Several due entities per poll (see the class comment). */
+    void sync(ScheduledExecutorService scheduler, BatchTask task) {
+        sync(scheduler, task, true);
+    }
+
+    private synchronized void sync(ScheduledExecutorService scheduler, BatchTask task, boolean batching) {
         Map<String, List<JsonObject>> byEntity = new LinkedHashMap<>();
         for (JsonObject q : TrackedReleaseSource.loadInputQueries()) {
             byEntity.computeIfAbsent(q.get("entity").getAsString(), k -> new ArrayList<>()).add(q);
@@ -84,6 +149,8 @@ class TrackedEntityScheduler {
                 e.getValue().cancel();
                 System.out.println("[" + label + "] Stopped polling '" + e.getKey() + "'"
                         + (current == null ? " (no longer tracked)." : " (keywords changed; rescheduling)."));
+            } else {
+                e.getValue().releaseDate = releaseDateOf(current); // an admin may have moved it
             }
             return !keep;
         });
@@ -95,86 +162,181 @@ class TrackedEntityScheduler {
             if (keywords.isEmpty()) continue;
             String category = entry.getValue().get(0).get("category").getAsString();
             long initialDelay = ThreadLocalRandom.current().nextLong(0, maxInitialDelaySeconds + 1);
-            EntityPoll poll = new EntityPoll(scheduler, task, entity, keywords, category);
+            EntityPoll poll = new EntityPoll(scheduler, task, batching, entity, keywords, category, releaseDateOf(entry.getValue()));
             scheduled.put(entity, poll);
             poll.scheduleIn(initialDelay);
-            System.out.println("[" + label + "] Queued '" + entity + "' " + keywords + " (initial delay " + initialDelay
-                    + "s, then every " + hours(baseIntervalSeconds) + "-" + hours(maxIntervalSeconds) + " depending on activity).");
+            System.out.println("[" + label + "] Queued '" + entity + "' " + keywords + " (initial delay " + initialDelay + "s).");
         }
     }
 
-    /** Next interval after a poll that found {@code newItems} new items, given the current one. */
-    long nextInterval(long currentSeconds, int newItems) {
-        if (newItems >= busyMinNewItems) return baseIntervalSeconds;
+    /** Next adaptive interval after a poll, given the current one. */
+    long nextInterval(long currentSeconds, PollResult result) {
+        if (result.newItems() >= busyMinNewItems && !result.capped()) return baseIntervalSeconds;
         return Math.min(maxIntervalSeconds, currentSeconds * 2);
+    }
+
+    /** Delay until the next poll, applying the daily-days rule to the adaptive interval. */
+    long nextDelay(long adaptiveSeconds, LocalDate releaseDate, ZonedDateTime nowIst) {
+        LocalDate today = nowIst.toLocalDate();
+        if (!isDailyDay(today, releaseDate)) return adaptiveSeconds;
+        // Never sleep past the start of the next day that isn't a daily day (within 7 days).
+        LocalDate open = today.plusDays(1);
+        while (isDailyDay(open, releaseDate) && open.isBefore(today.plusDays(8))) open = open.plusDays(1);
+        long untilOpen = Duration.between(nowIst, open.atStartOfDay(nowIst.getZone())).getSeconds();
+        return Math.max(60, Math.min(dailyIntervalSeconds, untilOpen));
+    }
+
+    private boolean isDailyDay(LocalDate date, LocalDate releaseDate) {
+        return dailyDays.contains(date.getDayOfWeek()) && !date.equals(releaseDate);
     }
 
     private final class EntityPoll {
         final ScheduledExecutorService scheduler;
-        final EntityTask task;
+        final BatchTask task;
+        final boolean batching;
         final String entity;
         final List<String> keywords;
         final String category;
+        volatile LocalDate releaseDate;
+        // Below: guarded by TrackedEntityScheduler.this.
         long intervalSeconds = baseIntervalSeconds;
         Instant previousPollAt;
-        private volatile boolean cancelled;
-        private ScheduledFuture<?> future;
+        Instant nextRunAt;
+        boolean running;
+        boolean cancelled;
+        ScheduledFuture<?> future;
 
-        EntityPoll(ScheduledExecutorService scheduler, EntityTask task, String entity, List<String> keywords, String category) {
+        EntityPoll(ScheduledExecutorService scheduler, BatchTask task, boolean batching, String entity,
+                   List<String> keywords, String category, LocalDate releaseDate) {
             this.scheduler = scheduler;
             this.task = task;
+            this.batching = batching;
             this.entity = entity;
             this.keywords = keywords;
             this.category = category;
+            this.releaseDate = releaseDate;
         }
 
-        synchronized void scheduleIn(long delaySeconds) {
-            if (cancelled) return;
-            try {
-                future = scheduler.schedule(this::runOnce, delaySeconds, TimeUnit.SECONDS);
-            } catch (RejectedExecutionException e) {
-                // Scheduler shut down (e.g. YouTube quota exhausted); this entity stops polling.
-                cancelled = true;
+        void scheduleIn(long delaySeconds) {
+            synchronized (TrackedEntityScheduler.this) {
+                if (cancelled) return;
+                nextRunAt = Instant.now().plusSeconds(delaySeconds);
+                try {
+                    future = scheduler.schedule(this::fire, delaySeconds, TimeUnit.SECONDS);
+                } catch (RejectedExecutionException e) {
+                    // Scheduler shut down (e.g. YouTube quota exhausted); this entity stops polling.
+                    cancelled = true;
+                }
             }
         }
 
-        synchronized void cancel() {
-            cancelled = true;
-            if (future != null) future.cancel(false);
+        void cancel() {
+            synchronized (TrackedEntityScheduler.this) {
+                cancelled = true;
+                if (future != null) future.cancel(false);
+            }
         }
 
-        private void runOnce() {
-            if (cancelled) return;
+        private void fire() {
+            Instant started = Instant.now();
+            // Claim this entity plus (batching) every other one due within the window.
+            List<EntityPoll> batch = new ArrayList<>();
+            synchronized (TrackedEntityScheduler.this) {
+                if (cancelled || running) return; // already polled as part of another batch
+                running = true;
+                batch.add(this);
+                if (batching && batchWindowSeconds > 0) {
+                    Instant horizon = started.plusSeconds(batchWindowSeconds);
+                    for (EntityPoll other : scheduled.values()) {
+                        if (other == this || other.running || other.cancelled) continue;
+                        if (other.nextRunAt == null || other.nextRunAt.isAfter(horizon)) continue;
+                        other.running = true;
+                        if (other.future != null) other.future.cancel(false);
+                        batch.add(other);
+                    }
+                }
+            }
+
             // Re-check right before spending API quota: an admin exclusion takes effect at once,
-            // not only at the next sync (which cancels this poll).
-            if (!TrackedReleaseSource.isActive(entity)) {
-                scheduleIn(skipRetrySeconds);
+            // not only at the next sync (which cancels the poll).
+            List<Due> due = new ArrayList<>();
+            List<EntityPoll> polled = new ArrayList<>();
+            for (EntityPoll p : batch) {
+                if (!TrackedReleaseSource.isActive(p.entity)) {
+                    p.finish(skipRetrySeconds);
+                    continue;
+                }
+                due.add(new Due(p.entity, p.keywords, p.category, p.previousPollAt));
+                polled.add(p);
+            }
+            if (polled.isEmpty()) return;
+            if (polled.size() > 1) {
+                System.out.println("\n[" + label + "] Polling " + polled.size() + " entities together: "
+                        + due.stream().map(Due::entity).toList());
+            } else {
+                System.out.println("\n[" + label + "] Polling entity: " + polled.get(0).entity);
+            }
+
+            Map<String, PollResult> results;
+            try {
+                results = task.run(due);
+            } catch (Exception e) {
+                System.err.println("[" + label + "] Poll failed for " + due.stream().map(Due::entity).toList()
+                        + " (retrying in " + hours(baseIntervalSeconds) + "): " + e.getMessage());
+                for (EntityPoll p : polled) p.finish(baseIntervalSeconds);
                 return;
             }
-            Instant started = Instant.now();
-            long next;
-            try {
-                System.out.println("\n[" + label + "] Polling entity: " + entity);
-                int newItems = task.run(entity, keywords, category, previousPollAt);
-                if (newItems == SKIPPED) {
-                    next = skipRetrySeconds;
+
+            ZonedDateTime nowIst = ZonedDateTime.now(TrackedReleaseSource.IST);
+            for (EntityPoll p : polled) {
+                PollResult r = results.get(p.entity);
+                if (r == null) {
+                    // Not polled after all: back on its own schedule (or base if it was this timer's own).
+                    long remaining = p == this || p.nextRunAt == null ? baseIntervalSeconds
+                            : Math.max(0, Duration.between(Instant.now(), p.nextRunAt).getSeconds());
+                    p.finish(remaining);
+                } else if (r.skipped()) {
+                    p.finish(skipRetrySeconds);
+                } else if (r.failed()) {
+                    System.err.println("[" + label + "] Poll failed for " + p.entity + " (retrying in " + hours(baseIntervalSeconds) + ").");
+                    p.finish(baseIntervalSeconds);
                 } else {
-                    previousPollAt = started;
-                    intervalSeconds = nextInterval(intervalSeconds, newItems);
-                    next = intervalSeconds;
-                    System.out.println("[" + label + "] '" + entity + "': " + newItems + " new item(s) -> "
-                            + (newItems >= busyMinNewItems ? "busy" : "quiet") + ", next poll in " + hours(next) + ".");
+                    p.previousPollAt = started;
+                    p.intervalSeconds = nextInterval(p.intervalSeconds, r);
+                    long delay = nextDelay(p.intervalSeconds, p.releaseDate, nowIst);
+                    String why = r.capped() ? "hit the result cap" : r.newItems() >= busyMinNewItems ? "busy" : "quiet";
+                    System.out.println("[" + label + "] '" + p.entity + "': " + r.newItems() + " new item(s) -> " + why
+                            + ", next poll in " + hours(delay) + (delay != p.intervalSeconds ? " (weekday schedule)" : "") + ".");
+                    p.finish(delay);
                 }
-            } catch (Exception e) {
-                next = baseIntervalSeconds;
-                System.err.println("[" + label + "] Poll failed for " + entity + " (retrying in " + hours(next) + "): " + e.getMessage());
             }
-            scheduleIn(next);
+        }
+
+        void finish(long delaySeconds) {
+            synchronized (TrackedEntityScheduler.this) {
+                running = false;
+            }
+            scheduleIn(delaySeconds);
         }
     }
 
     private static String hours(long seconds) {
-        return seconds % 3600 == 0 ? (seconds / 3600) + "h" : (seconds / 60) + "m";
+        return seconds % 3600 == 0 ? (seconds / 3600) + "h" : (seconds / 3600) + "h" + (seconds % 3600 / 60) + "m";
+    }
+
+    private static Set<DayOfWeek> parseDays(String value) {
+        if (value == null) return DEFAULT_DAILY_DAYS;
+        Set<DayOfWeek> days = EnumSet.noneOf(DayOfWeek.class);
+        for (String d : value.split(",")) {
+            if (!d.isBlank()) days.add(DayOfWeek.valueOf(d.trim().toUpperCase(Locale.ROOT)));
+        }
+        return days;
+    }
+
+    private static LocalDate releaseDateOf(List<JsonObject> queries) {
+        JsonObject q = queries.get(0);
+        if (!q.has("release_date") || q.get("release_date").isJsonNull()) return null;
+        return LocalDate.parse(q.get("release_date").getAsString());
     }
 
     private static List<String> keywordsOf(List<JsonObject> queries) {
