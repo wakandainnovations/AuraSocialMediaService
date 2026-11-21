@@ -48,7 +48,7 @@ import java.util.concurrent.TimeUnit;
  * {@code polling.batch.window.minutes} is handed to the same call, and each entity's schedule then
  * continues from that shared poll.
  *
- * <p>The tracked list changes on its own (movies enter/leave their ±7-day window, admins exclude
+ * <p>The tracked list changes on its own (movies enter/leave their ±2-day window, admins exclude
  * movies or edit keywords), so each {@code sync} reconciles against
  * {@link TrackedReleaseSource#loadInputQueries()}: new entities are scheduled, entities no longer
  * active are cancelled, and an entity whose keywords changed is rescheduled (its interval resets).
@@ -167,6 +167,14 @@ class TrackedEntityScheduler {
             poll.scheduleIn(initialDelay);
             System.out.println("[" + label + "] Queued '" + entity + "' " + keywords + " (initial delay " + initialDelay + "s).");
         }
+    }
+
+    /** Stops polling every entity (the next sync queues them again). */
+    synchronized void cancelAll() {
+        if (scheduled.isEmpty()) return;
+        scheduled.values().forEach(EntityPoll::cancel);
+        System.out.println("[" + label + "] Stopped polling " + scheduled.size() + " entit(ies).");
+        scheduled.clear();
     }
 
     /** Next adaptive interval after a poll, given the current one. */

@@ -152,6 +152,24 @@ public class ApifyClient {
         return new RunResult(items, run);
     }
 
+    /** The run's log as plain text (free to read), or "" when it can't be read. */
+    public static String fetchRunLog(String runId) {
+        if (runId == null) return "";
+        try {
+            HttpResponse<String> response = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
+                    .send(HttpRequest.newBuilder()
+                            .uri(URI.create(API_BASE_URL + "/actor-runs/" + runId + "/log"))
+                            .timeout(Duration.ofSeconds(60))
+                            .header("Authorization", "Bearer " + loadApiToken())
+                            .GET()
+                            .build(), HttpResponse.BodyHandlers.ofString());
+            return response.statusCode() >= 200 && response.statusCode() < 300 && response.body() != null ? response.body() : "";
+        } catch (Exception e) {
+            System.err.println("Reading the log of Apify run " + runId + " failed: " + e.getMessage());
+            return "";
+        }
+    }
+
     private static boolean isRunning(JsonObject run) {
         String status = run.has("status") ? run.get("status").getAsString() : "";
         return status.equals("READY") || status.equals("RUNNING");

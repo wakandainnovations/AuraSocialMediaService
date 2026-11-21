@@ -178,8 +178,9 @@ public class RelevanceCheckService implements SocialMediaScanner {
     private static List<Candidate> activeCandidates(LocalDate today) {
         List<Candidate> out = new ArrayList<>();
         String sql = "SELECT id, entity_name, keywords, language, original_title, context_terms, relevance_override, " +
-                "GREATEST((track_from::timestamp AT TIME ZONE 'Asia/Kolkata'), created_at) AS active_since " +
-                "FROM tracked_releases WHERE NOT excluded AND ? BETWEEN track_from AND track_until";
+                "GREATEST((GREATEST(track_from, release_date - " + Math.max(0, AppProperties.getIntProperty("tracking.days.before", 2))
+                + ")::timestamp AT TIME ZONE 'Asia/Kolkata'), created_at) AS active_since " +
+                "FROM tracked_releases WHERE NOT excluded AND " + TrackedReleaseSource.activeWindowSql();
         try (Connection conn = DatabaseService.getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
             pstmt.setDate(1, Date.valueOf(today));

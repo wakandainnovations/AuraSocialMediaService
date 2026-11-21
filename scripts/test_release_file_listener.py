@@ -43,7 +43,7 @@ class FileParsingTest(unittest.TestCase):
         self.assertEqual("Action,Thriller", m["genres"])
         self.assertEqual(165, m["runtime"])
         s = rfl.Settings({})
-        self.assertEqual((dt.date(2026, 11, 28), dt.date(2026, 12, 12)), rfl.window(m, s))
+        self.assertEqual((dt.date(2026, 12, 3), dt.date(2026, 12, 7)), rfl.window(m, s))
 
     def test_explicit_tracking_window_wins(self):
         m = rfl.parse_manual({"title": "X", "release_date": "2026-12-05", "track_from": "2026-12-01",

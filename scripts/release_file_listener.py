@@ -81,8 +81,8 @@ def split_list(value: Optional[str]) -> List[str]:
 
 class Settings:
     def __init__(self, props: Dict[str, str]):
-        self.days_before = int(props.get("tracking.days.before", 7))
-        self.days_after = int(props.get("tracking.days.after", 7))
+        self.days_before = int(props.get("tracking.days.before", 2))
+        self.days_after = int(props.get("tracking.days.after", 2))
         self.indian = {l.lower() for l in split_list(props.get("tracking.indian.languages", DEFAULT_INDIAN_LANGUAGES))}
         self.auto_track = {l.lower() for l in split_list(props.get("tracking.auto.track.languages",
                                                                     DEFAULT_AUTO_TRACK_LANGUAGES))}

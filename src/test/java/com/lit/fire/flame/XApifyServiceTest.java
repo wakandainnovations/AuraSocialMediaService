@@ -80,4 +80,14 @@ public class XApifyServiceTest extends TestCase {
                 XApifyService.coreQuery(List.of("MinnumOarIravu", "Minnum Oar Iravu", "Bhogi")));
         assertEquals("Minnum Oar Iravu", XApifyService.coreQuery(List.of("Minnum Oar Iravu")));
     }
+
+    public void testLogErrorFindsTheScraperOutage() {
+        String log = "2026-11-21T15:10:36.123Z ACTOR: Pulling container image\n"
+                + "2026-11-21T15:10:40.456Z ERROR Following a major Twitter update on Nov 21, Search is temporarily unavailable.\n"
+                + "2026-11-21T15:10:41.000Z Done.";
+        assertEquals("Following a major Twitter update on Nov 21, Search is temporarily unavailable.",
+                XApifyService.logError(log));
+        assertNull(XApifyService.logError("2026-11-21T15:10:36Z INFO Scraped 0 tweets\n2026-11-21T15:10:37Z Done."));
+        assertNull(XApifyService.logError(""));
+    }
 }

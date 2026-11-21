@@ -36,6 +36,8 @@ public class XService implements SocialMediaScanner {
     // multiple refreshMetrics jobs run concurrently and deadlock on overlapping x_posts rows.
     private final java.util.concurrent.atomic.AtomicBoolean initialized = new java.util.concurrent.atomic.AtomicBoolean(false);
     private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("Aura-X", 300);
+    // Set by XProviderFailover when X goes back to Apify: no polls, no refresh.
+    private volatile boolean paused;
     private static String ACCESS_TOKEN;
 //    private static final String API_URL = "https://api.twitter.com/2";
     private static final String API_URL = "https://api.x.com/2";
@@ -43,7 +45,7 @@ public class XService implements SocialMediaScanner {
 
     // X API hard cap for batched tweet lookups
     private static final int LOOKUP_BATCH_SIZE = 100;
-    // Ceiling on post-reads spent per hourly refresh cycle
+    // Ceiling on post-reads spent per refresh cycle
     private static final int MAX_REFRESH_PER_CYCLE = 100;
     // Max length of the recent-search `query` operator string (Basic access caps at 512 chars).
     // An entity with more keywords than fit is split across multiple OR'd search calls.
@@ -74,9 +76,11 @@ public class XService implements SocialMediaScanner {
      * recent-search calls (e.g. "(GDN OR GDNaidu)"). X de-duplicates its own results, so a tweet
      * that matches several of the entity's keywords is read (and billed) exactly once instead of
      * once per keyword. since_id is tracked per entity. When the keyword list is too long to fit in
-     * a single query (MAX_QUERY_CHARS), it is split across multiple OR'd calls.
+     * a single query (MAX_QUERY_CHARS), it is split across multiple OR'd calls. The result is
+     * "capped" when a call returned the full {@code numberOfPosts} (more may be waiting), which the
+     * scheduler treats like Apify's capped polls: back off rather than poll again in 4h.
      */
-    public static int search(String entity, List<String> keywords, String category) throws Exception {
+    public static TrackedEntityScheduler.PollResult search(String entity, List<String> keywords, String category) throws Exception {
         System.out.println("\nRetrieving latest " + numberOfPosts + " posts for entity '" + entity
                 + "' (keywords: " + String.join(", ", keywords) + ")...");
 
@@ -99,6 +103,7 @@ public class XService implements SocialMediaScanner {
         // seen), so a crash mid-cycle can't skip tweets the remaining chunks would have caught.
         String maxNewestId = null;
         int newPosts = 0;
+        boolean capped = false;
 
         for (List<String> chunk : chunks) {
             String encodedQuery = URLEncoder.encode(buildQuery(chunk), StandardCharsets.UTF_8);
@@ -119,7 +124,7 @@ public class XService implements SocialMediaScanner {
                         System.err.println("Stale since_id for '" + entity + "'. Updated to " + correctedId + " (30-min buffer) for next poll.");
                         DatabaseService.saveLastXPostId(entity, correctedId);
                     }
-                    return newPosts;
+                    return TrackedEntityScheduler.PollResult.of(newPosts, capped);
                 }
                 throw e;
             }
@@ -145,6 +150,7 @@ public class XService implements SocialMediaScanner {
 
             if (response != null && response.has("data")) {
                 JsonArray posts = response.getAsJsonArray("data");
+                capped |= posts.size() >= numberOfPosts;
                 JsonObject includes = response.getAsJsonObject("includes");
                 Map<String, JsonObject> users = new HashMap<>();
                 if (includes != null && includes.has("users")) {
@@ -189,7 +195,7 @@ public class XService implements SocialMediaScanner {
         if (maxNewestId != null) {
             DatabaseService.saveLastXPostId(entity, maxNewestId);
         }
-        return newPosts;
+        return TrackedEntityScheduler.PollResult.of(newPosts, capped);
     }
 
     // Logs a successful recent-search request's billable reads (posts + expanded users) to x_cost_log.
@@ -361,22 +367,32 @@ public class XService implements SocialMediaScanner {
         throw new RuntimeException("API Request failed. Status: " + response.statusCode() + ", Body: " + response.body());
     }
 
+    /** Stops polling and refreshing until the next scan(). */
+    void pause() {
+        paused = true;
+        entitySchedule.cancelAll();
+    }
+
     @Override
     public void scan() {
+        paused = false;
         // One-time setup (config + the single hourly metrics refresh) stays guarded: re-registering
         // refreshMetrics on every scan() is what deadlocked x_posts before.
         if (initialized.compareAndSet(false, true)) {
             try {
                 loadConfig();
                 System.out.println("Initializing X Search...");
-                // Hourly metrics refresh across all previously-collected posts (tiered policy in SQL).
+                // Metrics refresh across previously-collected posts (tiered policy in SQL), every
+                // x.refresh.interval.hours (8 by default, same as XApifyService).
+                long refreshEvery = Math.max(1, AppProperties.getIntProperty("x.refresh.interval.hours", 8)) * 3600L;
                 scheduler.scheduleAtFixedRate(() -> {
+                    if (paused) return;
                     try {
                         refreshMetrics();
                     } catch (Exception e) {
                         System.err.println("refreshMetrics failed: " + e.getMessage());
                     }
-                }, 600, 3600, TimeUnit.SECONDS);
+                }, 600, refreshEvery, TimeUnit.SECONDS);
             } catch (Exception e) {
                 System.err.println("An unrecoverable error occurred during the process.");
                 e.printStackTrace();
@@ -392,6 +408,6 @@ public class XService implements SocialMediaScanner {
         // combined into one OR'd query so a shared tweet is read once; initial starts are staggered
         // over 0-5 min to avoid hitting X rate limits at once.
         entitySchedule.sync(scheduler, (entity, keywords, category, previousPollAt) ->
-                TrackedEntityScheduler.PollResult.of(search(entity, keywords, category)));
+                search(entity, keywords, category));
     }
 }

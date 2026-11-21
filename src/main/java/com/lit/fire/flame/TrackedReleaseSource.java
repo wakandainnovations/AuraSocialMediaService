@@ -43,7 +43,7 @@ public class TrackedReleaseSource {
     public static List<JsonObject> loadInputQueries() {
         List<JsonObject> result = new ArrayList<>();
         String sql = "SELECT entity_name, keywords, category, language, release_date FROM tracked_releases " +
-                "WHERE NOT excluded AND ? BETWEEN track_from AND track_until " +
+                "WHERE NOT excluded AND " + activeWindowSql() + " " +
                 "ORDER BY release_date, entity_name";
         try (Connection conn = DatabaseService.getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
@@ -79,7 +79,7 @@ public class TrackedReleaseSource {
      */
     public static boolean isActive(String entity) {
         String sql = "SELECT 1 FROM tracked_releases WHERE entity_name = ? " +
-                "AND NOT excluded AND ? BETWEEN track_from AND track_until";
+                "AND NOT excluded AND " + activeWindowSql();
         try (Connection conn = DatabaseService.getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
             pstmt.setString(1, entity);
@@ -92,6 +92,19 @@ public class TrackedReleaseSource {
             System.err.println("Database error checking tracked release '" + entity + "': " + e.getMessage());
             return true;
         }
+    }
+
+    /**
+     * SQL condition "today (bound as ?) is inside the movie's tracking window". The stored
+     * track_from/track_until are clamped to release_date -/+ tracking.days.before/after, so
+     * narrowing those settings takes effect at once, including for rows stored under a wider window.
+     */
+    static String activeWindowSql() {
+        int before = Math.max(0, AppProperties.getIntProperty("tracking.days.before", 2));
+        int after = Math.max(0, AppProperties.getIntProperty("tracking.days.after", 2));
+        // GREATEST/LEAST ignore NULLs, so a row without a release_date keeps its stored window.
+        return "? BETWEEN GREATEST(track_from, release_date - " + before + ") "
+                + "AND LEAST(track_until, release_date + " + after + ")";
     }
 
     static List<String> splitKeywords(String keywords) {
@@ -128,7 +141,7 @@ public class TrackedReleaseSource {
      */
     public static boolean isApifyEligible(String entity) {
         String sql = "SELECT relevance_override OR relevance_checked_at IS NOT NULL FROM tracked_releases " +
-                "WHERE entity_name = ? AND NOT excluded AND ? BETWEEN track_from AND track_until";
+                "WHERE entity_name = ? AND NOT excluded AND " + activeWindowSql();
         try (Connection conn = DatabaseService.getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
             pstmt.setString(1, entity);

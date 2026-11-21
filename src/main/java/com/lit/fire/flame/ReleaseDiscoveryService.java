@@ -45,11 +45,11 @@ public class ReleaseDiscoveryService implements SocialMediaScanner {
     static final String DEFAULT_AUTO_TRACK_LANGUAGES = "tamil,telugu,kannada,malayalam";
 
     static int daysBefore() {
-        return AppProperties.getIntProperty("tracking.days.before", 7);
+        return AppProperties.getIntProperty("tracking.days.before", 2);
     }
 
     static int daysAfter() {
-        return AppProperties.getIntProperty("tracking.days.after", 7);
+        return AppProperties.getIntProperty("tracking.days.after", 2);
     }
 
     static Set<String> indianLanguages() {

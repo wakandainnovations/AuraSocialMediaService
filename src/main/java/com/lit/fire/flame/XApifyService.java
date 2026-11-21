@@ -40,7 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *       x.provider either way resumes from the same tweet. Movies due within the same window share
  *       searches ({@link #pollDue}): several movies' keywords in one query, each tweet saved under
  *       the movies whose keywords its text contains.</li>
- *   <li><b>Likes / replies / views refresh</b>: hourly, using the same tiered candidate set and the
+ *   <li><b>Likes / replies / views refresh</b>: every x.refresh.interval.hours (8h), using the same tiered candidate set and the
  *       same 100-posts-per-cycle cap as XService.refreshMetrics. Instead of a per-tweet lookup (the
  *       Actor bills $0.05 per tweet URL), due tweets are grouped per entity into id-range slices
  *       and each slice's search is re-run over just its range ({@code since_id:/max_id:}), which
@@ -61,7 +61,7 @@ public class XApifyService implements SocialMediaScanner {
 
     // One-off, large, date-bounded backfill queries (needs >= 50 results per query; no monitoring).
     private static final String BACKFILL_ACTOR_ID = "apidojo/tweet-scraper";
-    // Hourly polling + metric refresh (event-priced: $0.016/query incl. ~40 tweets, then per tweet).
+    // Polling + metric refresh (event-priced: $0.016/query incl. ~40 tweets, then per tweet).
     private static final String SCAN_ACTOR_ID = "apidojo/twitter-scraper-lite";
     // The lite Actor allows only one concurrent run per account.
     private static final Object SCAN_ACTOR_LOCK = new Object();
@@ -86,6 +86,19 @@ public class XApifyService implements SocialMediaScanner {
     // See XService: Main re-invokes scan() hourly, so one-time setup must not re-register the refresh.
     private final AtomicBoolean initialized = new AtomicBoolean(false);
     private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("Aura-X/Apify", 300);
+    // Set by XProviderFailover while the X API covers for the scraper: no polls, no refresh.
+    private volatile boolean paused;
+
+    // Why the scraper can't search right now (null when it can). Set when a run comes back empty
+    // with an error in its log (e.g. "Search is temporarily unavailable"), cleared by a working probe().
+    private static volatile String outageReason;
+
+    /** Thrown when the scraper's run "succeeded" but its log shows it couldn't search. */
+    static final class ScraperUnavailableException extends Exception {
+        ScraperUnavailableException(String message) {
+            super(message);
+        }
+    }
 
     private static void loadConfig() {
         numberOfPosts = AppProperties.getIntProperty("x.apify.max_items",
@@ -109,6 +122,13 @@ public class XApifyService implements SocialMediaScanner {
      */
     static Map<String, TrackedEntityScheduler.PollResult> pollDue(List<TrackedEntityScheduler.Due> due) {
         Map<String, TrackedEntityScheduler.PollResult> results = new LinkedHashMap<>();
+        if (outageReason != null) {
+            // Don't pay for more runs that can't search; XProviderFailover moves X to the X API.
+            System.out.println("[Apify/X] Scraper unavailable (" + outageReason + "); not polling "
+                    + due.stream().map(TrackedEntityScheduler.Due::entity).toList() + ".");
+            for (TrackedEntityScheduler.Due d : due) results.put(d.entity(), TrackedEntityScheduler.PollResult.FAILED);
+            return results;
+        }
         List<Member> shareable = new ArrayList<>();
         for (TrackedEntityScheduler.Due d : due) {
             String sinceId = validSinceId(DatabaseService.getLastXPostId(d.entity()));
@@ -538,23 +558,81 @@ public class XApifyService implements SocialMediaScanner {
         }
         System.out.println("[Apify/X] Returned " + run.items().size() + " item(s).");
         XCostTracker.recordApifyScanRun(operation, entity, run);
+        if (run.items().isEmpty()) {
+            // An empty result is normal for a quiet movie, but the scraper also reports an outage as a
+            // "successful" empty run, with the reason only in its log.
+            String error = logError(ApifyClient.fetchRunLog(run.runId()));
+            if (error != null) {
+                outageReason = error;
+                throw new ScraperUnavailableException("Apify X scraper can't search: " + error);
+            }
+        }
         return run.items();
+    }
+
+    /** The first ERROR line of a run log (without the timestamp), or null when there is none. */
+    static String logError(String log) {
+        if (log == null) return null;
+        for (String line : log.split("\\R")) {
+            int at = line.indexOf("ERROR");
+            if (at >= 0) {
+                String message = line.substring(at + "ERROR".length()).trim();
+                return message.isEmpty() ? "ERROR" : message;
+            }
+        }
+        return null;
+    }
+
+    static String outageReason() {
+        return outageReason;
+    }
+
+    /**
+     * Whether the scraper can search again: one small search for {@code x.failover.probe.query}
+     * (a term that always has fresh tweets). Returns true, and clears the outage, when it returns
+     * tweets. Costs one query ($0.016) per call.
+     */
+    static boolean probe() {
+        String query = AppProperties.getProperty("x.failover.probe.query");
+        if (query == null || query.isBlank()) query = "cinema";
+        try {
+            JsonArray items = runScanActor("probe", "(health check)", query.trim(), 40);
+            if (items.isEmpty()) {
+                if (outageReason == null) outageReason = "probe search returned no tweets";
+                return false;
+            }
+            outageReason = null;
+            return true;
+        } catch (Exception e) {
+            if (outageReason == null) outageReason = e.getMessage();
+            System.err.println("[Apify/X] Probe failed: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** Stops polling and refreshing until the next scan(). */
+    void pause() {
+        paused = true;
+        entitySchedule.cancelAll();
     }
 
     @Override
     public void scan() {
+        paused = false;
         if (initialized.compareAndSet(false, true)) {
             loadConfig();
             System.out.println("Initializing X Apify Search (up to " + numberOfPosts + " new tweets per entity per poll)...");
-            // Hourly metrics refresh across all previously-collected posts (tiered policy in SQL),
-            // on the same schedule as XService.
+            // Metrics refresh across previously-collected posts (tiered policy in SQL), every
+            // x.refresh.interval.hours (8 by default), on the same schedule as XService.
+            long refreshEvery = Math.max(1, AppProperties.getIntProperty("x.refresh.interval.hours", 8)) * 3600L;
             scheduler.scheduleAtFixedRate(() -> {
+                if (paused) return;
                 try {
                     refreshMetrics();
                 } catch (Exception e) {
                     System.err.println("[Aura-X/Apify] refreshMetrics failed: " + e.getMessage());
                 }
-            }, 600, 3600, TimeUnit.SECONDS);
+            }, 600, refreshEvery, TimeUnit.SECONDS);
         }
         // Not gated on TrackedReleaseSource.isApifyEligible: RelevanceCheckService needs these X
         // posts to make that decision in the first place.

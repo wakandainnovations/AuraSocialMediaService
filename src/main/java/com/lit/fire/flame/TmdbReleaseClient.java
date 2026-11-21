@@ -80,7 +80,7 @@ public class TmdbReleaseClient {
      * festival-only screenings and OTT/digital-only premieres, which TMDB records as other release
      * types (or none). Each hit is then re-fetched for its India theatrical date: the discover
      * result's own release_date is the earliest release anywhere (e.g. a festival or overseas
-     * premiere), which would put the ±7-day tracking window in the wrong place.
+     * premiere), which would put the ±2-day tracking window in the wrong place.
      */
     public List<Release> discoverIndianReleases(LocalDate from, LocalDate to) throws Exception {
         List<Integer> ids = new ArrayList<>();
