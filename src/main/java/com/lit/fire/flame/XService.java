@@ -35,7 +35,7 @@ public class XService implements SocialMediaScanner {
     // tasks (search + refreshMetrics) on top of the still-running ones, so after a few hours
     // multiple refreshMetrics jobs run concurrently and deadlock on overlapping x_posts rows.
     private final java.util.concurrent.atomic.AtomicBoolean initialized = new java.util.concurrent.atomic.AtomicBoolean(false);
-    private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("Aura-X", 3600, 300);
+    private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("Aura-X", 300);
     private static String ACCESS_TOKEN;
 //    private static final String API_URL = "https://api.twitter.com/2";
     private static final String API_URL = "https://api.x.com/2";
@@ -76,7 +76,7 @@ public class XService implements SocialMediaScanner {
      * once per keyword. since_id is tracked per entity. When the keyword list is too long to fit in
      * a single query (MAX_QUERY_CHARS), it is split across multiple OR'd calls.
      */
-    public static void search(String entity, List<String> keywords, String category) throws Exception {
+    public static int search(String entity, List<String> keywords, String category) throws Exception {
         System.out.println("\nRetrieving latest " + numberOfPosts + " posts for entity '" + entity
                 + "' (keywords: " + String.join(", ", keywords) + ")...");
 
@@ -98,6 +98,7 @@ public class XService implements SocialMediaScanner {
         // Advance the entity's since_id only after all chunks are processed (using the max newest_id
         // seen), so a crash mid-cycle can't skip tweets the remaining chunks would have caught.
         String maxNewestId = null;
+        int newPosts = 0;
 
         for (List<String> chunk : chunks) {
             String encodedQuery = URLEncoder.encode(buildQuery(chunk), StandardCharsets.UTF_8);
@@ -118,7 +119,7 @@ public class XService implements SocialMediaScanner {
                         System.err.println("Stale since_id for '" + entity + "'. Updated to " + correctedId + " (30-min buffer) for next poll.");
                         DatabaseService.saveLastXPostId(entity, correctedId);
                     }
-                    return;
+                    return newPosts;
                 }
                 throw e;
             }
@@ -181,12 +182,14 @@ public class XService implements SocialMediaScanner {
                 }
                 // Pass only this chunk's keywords so matched-keyword detection stays accurate.
                 DatabaseService.saveXPosts(posts, entity, chunk, category);
+                newPosts += posts.size();
             }
         }
 
         if (maxNewestId != null) {
             DatabaseService.saveLastXPostId(entity, maxNewestId);
         }
+        return newPosts;
     }
 
     // Logs a successful recent-search request's billable reads (posts + expanded users) to x_cost_log.
@@ -375,9 +378,10 @@ public class XService implements SocialMediaScanner {
         }
 
         // Runs on every scan() (Main calls it hourly): the tracked-release list changes on its own
-        // as movies enter/leave their window or are excluded in the admin UI. One poll per entity,
-        // every hour, with its keywords combined into one OR'd query so a shared tweet is read
-        // once; initial starts are staggered over 0-5 min to avoid hitting X rate limits at once.
-        entitySchedule.sync(scheduler, XService::search);
+        // as movies enter/leave their window or are excluded in the admin UI. One adaptive poll per
+        // entity (TrackedEntityScheduler: 4h, backing off to 24h when quiet), with its keywords
+        // combined into one OR'd query so a shared tweet is read once; initial starts are staggered
+        // over 0-5 min to avoid hitting X rate limits at once.
+        entitySchedule.sync(scheduler, (entity, keywords, category, previousPollAt) -> search(entity, keywords, category));
     }
 }

@@ -9,6 +9,7 @@ import com.google.api.services.youtube.model.VideoStatistics;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.lit.fire.api.SocialMediaScanner;
@@ -35,7 +36,7 @@ public class YouTubeMain implements SocialMediaScanner {
     private static int numberOfVideos;
     private static int numberOfComments;
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
-    private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("YouTube", 14400, 60);
+    private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("YouTube", 300);
 
     // Package-private (not private) so MovieBackfillService can populate API_KEY/numberOfComments
     // before calling search(...) directly, without going through scan()'s scheduler setup.
@@ -79,6 +80,15 @@ public class YouTubeMain implements SocialMediaScanner {
      * {@code numberOfVideos} field with the regular scheduled scan.
      */
     public static void search(String entity, List<String> keywords, String category, int maxVideos, java.time.Instant publishedAfter) throws Exception {
+        search(entity, keywords, category, maxVideos, publishedAfter, null);
+    }
+
+    /**
+     * The search itself. Returns how many of the comments and videos it read were published after
+     * {@code newSince} (all of them when null) - the scheduled poll's activity measure.
+     */
+    private static int search(String entity, List<String> keywords, String category, int maxVideos,
+                              java.time.Instant publishedAfter, java.time.Instant newSince) throws Exception {
         String combinedQuery = buildQuery(keywords);
         System.out.println("\nRetrieving latest " + maxVideos + " videos for entity '" + entity
                 + "' (keywords: " + String.join(", ", keywords) + ")...");
@@ -88,7 +98,7 @@ public class YouTubeMain implements SocialMediaScanner {
 
         if (videos.isEmpty()) {
             System.out.println("No videos found for entity: '" + entity + "'");
-            return;
+            return 0;
         }
 
         System.out.println("Search successful. Found " + videos.size() + " videos.");
@@ -141,6 +151,15 @@ public class YouTubeMain implements SocialMediaScanner {
             }
         }
 
+        int newItems = 0;
+        for (JsonElement comment : videoComments) {
+            if (isAfter(comment.getAsJsonObject().get("published_at"), newSince)) newItems++;
+        }
+        for (SearchResult video : uniqueVideos.values()) {
+            com.google.api.client.util.DateTime published = video.getSnippet().getPublishedAt();
+            if (newSince == null || (published != null && published.getValue() > newSince.toEpochMilli())) newItems++;
+        }
+
         if (videoComments.size() > 0) {
             DatabaseService.saveYouTubeComments(videoComments, entity, keywords, category);
         }
@@ -177,6 +196,19 @@ public class YouTubeMain implements SocialMediaScanner {
             }
 
             DatabaseService.saveYouTubeVideos(videoDocs, entity, keywords, category);
+        }
+        return newItems;
+    }
+
+    // Whether an ISO-8601 published_at is after {@code since} (always true when since is null;
+    // an unparseable timestamp counts as new rather than hiding activity).
+    private static boolean isAfter(JsonElement publishedAt, java.time.Instant since) {
+        if (since == null) return true;
+        if (publishedAt == null || publishedAt.isJsonNull()) return true;
+        try {
+            return java.time.OffsetDateTime.parse(publishedAt.getAsString()).toInstant().isAfter(since);
+        } catch (Exception e) {
+            return true;
         }
     }
 
@@ -217,20 +249,20 @@ public class YouTubeMain implements SocialMediaScanner {
             loadConfig();
             System.out.println("Syncing YouTube entity polls...");
             // Reconciles against the tracked-release list on every scan() (Main calls it hourly):
-            // one poll per entity every 4 hours, keywords combined into one OR'd video search so a
-            // shared video's comments are read/stored once. Previously each scan() re-scheduled
-            // every entity again, stacking duplicate polls hour after hour.
-            entitySchedule.sync(scheduler, (entity, keywords, category) -> {
+            // one adaptive poll per entity (TrackedEntityScheduler: 4h, backing off to 24h when
+            // quiet), keywords combined into one OR'd video search so a shared video's comments are
+            // read/stored once.
+            entitySchedule.sync(scheduler, (entity, keywords, category, previousPollAt) -> {
                 try {
-                    search(entity, keywords, category);
+                    return search(entity, keywords, category, numberOfVideos, null, previousPollAt);
                 } catch (GoogleJsonResponseException e) {
                     if (e.getDetails() != null && e.getDetails().getCode() == 403
                             && e.getDetails().getMessage() != null && e.getDetails().getMessage().contains("quota")) {
                         System.err.println("YouTube API quota exceeded. Shutting down all tasks.");
                         scheduler.shutdown();
-                    } else {
-                        System.err.println("Google API error for " + entity + ": " + e.getMessage());
+                        return TrackedEntityScheduler.SKIPPED;
                     }
+                    throw e; // logged by the scheduler, retried after the base interval
                 }
             });
         } catch (Exception e) {

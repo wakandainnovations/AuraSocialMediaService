@@ -19,6 +19,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.stream.Collectors;
 
 /**
@@ -44,15 +46,11 @@ public class InstagramApifyService implements SocialMediaScanner {
     // Platform key used for DatabaseService.getLastFetchTime/updateLastFetchTime(...)'s per-entity
     // fetch cursor.
     private static final String PLATFORM = "instagram";
-    // Fixed delay between consecutive Apify calls (one per entity), so calls aren't back-to-back.
-    private static final long ENTITY_DELAY_MS = 60 * 60 * 1000; // 1 hour
+    // A single thread, so this scanner's Actor runs never overlap.
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("Apify/Instagram", 300);
 
     private static int numberOfPosts;
-
-    // The tracked-release list (auto-discovered + admin-edited), not search_queries.txt.
-    private static List<JsonObject> loadInputQueries() {
-        return TrackedReleaseSource.loadInputQueries();
-    }
 
     /**
      * Scrapes all of an entity's hashtags in a single Actor run (this Actor's "hashtags" input is
@@ -72,10 +70,10 @@ public class InstagramApifyService implements SocialMediaScanner {
      * can't share the mutable {@code numberOfPosts} field. This Actor has no server-side date
      * filter, so "not older than" is enforced by filtering the returned items client-side.
      */
-    public static void search(String entity, List<String> keywords, String category, int resultsLimit, Instant notOlderThan) throws Exception {
+    public static int search(String entity, List<String> keywords, String category, int resultsLimit, Instant notOlderThan) throws Exception {
         List<String> hashtagTerms = normalizeHashtags(keywords);
         if (hashtagTerms.isEmpty()) {
-            return;
+            return 0;
         }
         System.out.println("[Apify/Instagram] Scraping hashtags " + hashtagTerms + " for entity '" + entity + "'...");
 
@@ -112,6 +110,7 @@ public class InstagramApifyService implements SocialMediaScanner {
         if (entityPosts.size() > 0) {
             DatabaseService.saveInstagramPosts(entityPosts, entity, keywords, category);
         }
+        return entityPosts.size();
     }
 
     /**
@@ -348,73 +347,28 @@ public class InstagramApifyService implements SocialMediaScanner {
 
     @Override
     public void scan() {
-        // Entities whose Actor run failed this pass. One failure no longer ends the pass for every
-        // entity after it; the failed entity keeps its old cursor and the pass moves on. Failures
-        // are re-thrown at the end so Main logs them and retries sooner, instead of the pass
-        // quietly "succeeding" and waiting the full 12h.
-        List<String> failedEntities = new ArrayList<>();
-        try {
-            numberOfPosts = AppProperties.getIntProperty("number.of.posts", 10);
-            System.out.println("Initializing Instagram Apify Search...");
-            List<JsonObject> inputQueries = loadInputQueries();
+        numberOfPosts = AppProperties.getIntProperty("number.of.posts", 10);
+        // Runs on every scan() (Main calls it hourly) to pick up tracking changes; each entity is
+        // polled on TrackedEntityScheduler's adaptive interval (4h, backing off to 24h when quiet).
+        entitySchedule.sync(scheduler, InstagramApifyService::poll);
+    }
 
-            // Group keyword lines by entity and process once per entity so a post shared across the
-            // entity's hashtags is collected and stored only once.
-            Map<String, List<JsonObject>> queriesByEntity = new LinkedHashMap<>();
-            for (JsonObject inputQuery : inputQueries) {
-                String entity = inputQuery.get("entity").getAsString();
-                queriesByEntity.computeIfAbsent(entity, k -> new ArrayList<>()).add(inputQuery);
-            }
-
-            for (Map.Entry<String, List<JsonObject>> entry : queriesByEntity.entrySet()) {
-                String entity = entry.getKey();
-                List<JsonObject> queries = entry.getValue();
-                List<String> keywords = queries.stream()
-                        .map(q -> q.get("keyword").getAsString())
-                        .collect(Collectors.toList());
-                String category = queries.get(0).get("category").getAsString();
-                // A pass spends an hour per entity, so re-check: an admin exclusion (or the window
-                // closing) mid-pass skips the paid Actor run instead of waiting for the next pass.
-                if (!TrackedReleaseSource.isActive(entity)) {
-                    System.out.println("[Apify/Instagram] Skipping '" + entity + "' (no longer tracked).");
-                    continue;
-                }
-                // Paid run: wait until the relevance check has cleared this movie from its X posts.
-                if (!TrackedReleaseSource.isApifyEligible(entity)) {
-                    System.out.println("[Apify/Instagram] Skipping '" + entity + "' (awaiting relevance check).");
-                    continue;
-                }
-                System.out.println("\n[Apify/Instagram] Processing entity: " + entity + " -> keywords " + keywords);
-
-                // This Actor has no server-side date filter (unlike Reddit's), so it always returns
-                // up to numberOfPosts items regardless of what's new - the notOlderThan filter below
-                // only avoids re-saving posts already stored under this entity's last fetch, it does
-                // not reduce what's billed for the call itself. Frequency (see Main.APIFY_SUCCESS_DELAY_MS)
-                // is the actual cost lever for this scanner.
-                try {
-                    Instant lastFetch = DatabaseService.getLastFetchTime(PLATFORM, entity);
-                    Instant scanStart = Instant.now();
-                    search(entity, keywords, category, numberOfPosts, lastFetch);
-                    DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
-                } catch (Exception e) {
-                    failedEntities.add(entity);
-                    System.err.println("[Apify/Instagram] Scan failed for '" + entity + "' (cursor left unchanged): " + e);
-                    e.printStackTrace();
-                    continue; // nothing was collected, so don't spend the hour's spacing on it
-                }
-
-                System.out.println(System.currentTimeMillis() + ": Waiting 60 minutes before the next entity...");
-                Thread.sleep(ENTITY_DELAY_MS);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Instagram Apify scan interrupted", e);
-        } catch (Exception e) {
-            throw new RuntimeException("Instagram Apify scan failed: " + e.getMessage(), e);
+    // One entity's scheduled poll. Returns how many new posts were saved, or SKIPPED.
+    private static int poll(String entity, List<String> keywords, String category, Instant previousPollAt) throws Exception {
+        // Paid run: wait until the relevance check has cleared this movie from its X posts.
+        if (!TrackedReleaseSource.isApifyEligible(entity)) {
+            System.out.println("[Apify/Instagram] Skipping '" + entity + "' (awaiting relevance check).");
+            return TrackedEntityScheduler.SKIPPED;
         }
-        if (!failedEntities.isEmpty()) {
-            throw new RuntimeException("Instagram Apify scan failed for " + failedEntities.size() + " entit"
-                    + (failedEntities.size() == 1 ? "y" : "ies") + ": " + failedEntities);
-        }
+        System.out.println("[Apify/Instagram] Processing entity: " + entity + " -> keywords " + keywords);
+        // This Actor has no server-side date filter, so it always returns (and bills) up to
+        // numberOfPosts items regardless of what's new - the notOlderThan filter only avoids
+        // re-saving posts already stored. Polling quiet movies less often is the cost lever here.
+        // On failure the cursor is left unchanged, so nothing is skipped.
+        Instant lastFetch = DatabaseService.getLastFetchTime(PLATFORM, entity);
+        Instant scanStart = Instant.now();
+        int saved = search(entity, keywords, category, numberOfPosts, lastFetch);
+        DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
+        return saved;
     }
 }

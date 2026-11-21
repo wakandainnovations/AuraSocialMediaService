@@ -17,6 +17,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.stream.Collectors;
 
 /**
@@ -34,8 +36,9 @@ public class RedditApifyService implements SocialMediaScanner {
     // Platform key used for DatabaseService.getLastFetchTime/updateLastFetchTime(...)'s per-entity
     // fetch cursor.
     private static final String PLATFORM = "reddit";
-    // Fixed delay between consecutive Apify calls (one per entity), so calls aren't back-to-back.
-    private static final long ENTITY_DELAY_MS = 60 * 60 * 1000; // 1 hour
+    // A single thread, so this scanner's Actor runs never overlap.
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("Apify/Reddit", 300);
     // The Actor rejects anything but a strict YYYY-MM-DD for dateFrom/dateTo (400 invalid-input),
     // so Instant.toString()'s full ISO-8601 timestamp (e.g. "2026-08-04T10:15:30.123Z") can't be
     // passed through as-is.
@@ -43,11 +46,6 @@ public class RedditApifyService implements SocialMediaScanner {
             java.time.format.DateTimeFormatter.ISO_LOCAL_DATE.withZone(ZoneOffset.UTC);
 
     private static int numberOfPosts;
-
-    // The tracked-release list (auto-discovered + admin-edited), not search_queries.txt.
-    private static List<JsonObject> loadInputQueries() {
-        return TrackedReleaseSource.loadInputQueries();
-    }
 
     /**
      * Scrapes a single entity in one Actor run, passing all of the entity's keywords as `queries`
@@ -66,7 +64,8 @@ public class RedditApifyService implements SocialMediaScanner {
      * and so can't share the mutable {@code numberOfPosts} field. Unlike Instagram's Actor, this
      * one supports server-side date bounds, so no client-side post-filtering is needed.
      */
-    public static void search(String entity, List<String> keywords, String category, int maxPosts, String dateFrom, String dateTo) throws Exception {
+    // Returns the posts it saved.
+    public static JsonArray search(String entity, List<String> keywords, String category, int maxPosts, String dateFrom, String dateTo) throws Exception {
         System.out.println("[Apify/Reddit] Searching entity '" + entity + "' -> keywords " + keywords);
 
         JsonArray queries = new JsonArray();
@@ -111,6 +110,7 @@ public class RedditApifyService implements SocialMediaScanner {
         if (posts.size() > 0) {
             DatabaseService.saveRedditPosts(posts, entity, keywords, category);
         }
+        return posts;
     }
 
     /**
@@ -257,74 +257,35 @@ public class RedditApifyService implements SocialMediaScanner {
 
     @Override
     public void scan() {
-        // Entities whose Actor run failed this pass. One failure no longer ends the pass for every
-        // entity after it; the failed entity keeps its old cursor (so nothing is skipped) and the
-        // pass moves on. Failures are re-thrown at the end so Main logs them and retries sooner,
-        // instead of the pass quietly "succeeding" and waiting the full 12h.
-        List<String> failedEntities = new ArrayList<>();
-        try {
-            numberOfPosts = AppProperties.getIntProperty("number.of.posts", 10);
-            System.out.println("Initializing Reddit Apify Search...");
-            List<JsonObject> inputQueries = loadInputQueries();
+        numberOfPosts = AppProperties.getIntProperty("number.of.posts", 10);
+        // Runs on every scan() (Main calls it hourly) to pick up tracking changes; each entity is
+        // polled on TrackedEntityScheduler's adaptive interval (4h, backing off to 24h when quiet).
+        entitySchedule.sync(scheduler, RedditApifyService::poll);
+    }
 
-            // Group keyword lines by entity and search once per entity so a post matching several of
-            // the entity's keywords is stored only once (composite id postId_entity).
-            Map<String, List<JsonObject>> queriesByEntity = new LinkedHashMap<>();
-            for (JsonObject inputQuery : inputQueries) {
-                String entity = inputQuery.get("entity").getAsString();
-                queriesByEntity.computeIfAbsent(entity, k -> new ArrayList<>()).add(inputQuery);
-            }
-
-            for (Map.Entry<String, List<JsonObject>> entry : queriesByEntity.entrySet()) {
-                String entity = entry.getKey();
-                List<JsonObject> queries = entry.getValue();
-                List<String> keywords = queries.stream()
-                        .map(q -> q.get("keyword").getAsString())
-                        .filter(k -> !k.isEmpty())
-                        .collect(Collectors.toList());
-                if (keywords.isEmpty()) {
-                    continue;
-                }
-                String category = queries.get(0).get("category").getAsString();
-                // A pass spends an hour per entity, so re-check: an admin exclusion (or the window
-                // closing) mid-pass skips the paid Actor run instead of waiting for the next pass.
-                if (!TrackedReleaseSource.isActive(entity)) {
-                    System.out.println("[Apify/Reddit] Skipping '" + entity + "' (no longer tracked).");
-                    continue;
-                }
-                // Paid run: wait until the relevance check has cleared this movie from its X posts.
-                if (!TrackedReleaseSource.isApifyEligible(entity)) {
-                    System.out.println("[Apify/Reddit] Skipping '" + entity + "' (awaiting relevance check).");
-                    continue;
-                }
-
-                // Only ask the Actor for posts newer than this entity's last successful fetch, so a
-                // repeat scan isn't billed again for content already saved. First-ever fetch for an
-                // entity has no cursor yet and behaves like today (no lower bound).
-                try {
-                    Instant lastFetch = DatabaseService.getLastFetchTime(PLATFORM, entity);
-                    Instant scanStart = Instant.now();
-                    search(entity, keywords, category, numberOfPosts, lastFetch != null ? DATE_FORMATTER.format(lastFetch) : null, null);
-                    DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
-                } catch (Exception e) {
-                    failedEntities.add(entity);
-                    System.err.println("[Apify/Reddit] Scan failed for '" + entity + "' (cursor left unchanged): " + e);
-                    e.printStackTrace();
-                    continue; // nothing was collected, so don't spend the hour's spacing on it
-                }
-
-                System.out.println(System.currentTimeMillis() + ": Waiting 60 minutes before the next entity...");
-                Thread.sleep(ENTITY_DELAY_MS);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RuntimeException("Reddit Apify scan interrupted", e);
-        } catch (Exception e) {
-            throw new RuntimeException("Reddit Apify scan failed: " + e.getMessage(), e);
+    // One entity's scheduled poll. Returns how many posts newer than the last fetch came back, or SKIPPED.
+    private static int poll(String entity, List<String> keywords, String category, Instant previousPollAt) throws Exception {
+        // Paid run: wait until the relevance check has cleared this movie from its X posts.
+        if (!TrackedReleaseSource.isApifyEligible(entity)) {
+            System.out.println("[Apify/Reddit] Skipping '" + entity + "' (awaiting relevance check).");
+            return TrackedEntityScheduler.SKIPPED;
         }
-        if (!failedEntities.isEmpty()) {
-            throw new RuntimeException("Reddit Apify scan failed for " + failedEntities.size() + " entit"
-                    + (failedEntities.size() == 1 ? "y" : "ies") + ": " + failedEntities);
+        // Only ask the Actor for posts since this entity's last successful fetch, so a repeat scan
+        // isn't billed again for content already saved. First-ever fetch has no lower bound. On
+        // failure the cursor is left unchanged, so nothing is skipped.
+        Instant lastFetch = DatabaseService.getLastFetchTime(PLATFORM, entity);
+        Instant scanStart = Instant.now();
+        JsonArray posts = search(entity, keywords, category, numberOfPosts,
+                lastFetch != null ? DATE_FORMATTER.format(lastFetch) : null, null);
+        DatabaseService.updateLastFetchTime(PLATFORM, entity, scanStart);
+        // dateFrom is day-granular, so the run also returns earlier posts from that day; only
+        // posts after the last fetch count towards this movie's activity.
+        if (lastFetch == null) return posts.size();
+        int newPosts = 0;
+        for (JsonElement el : posts) {
+            JsonObject post = el.getAsJsonObject();
+            if (post.has("created_utc") && post.get("created_utc").getAsLong() >= lastFetch.getEpochSecond()) newPosts++;
         }
+        return newPosts;
     }
 }

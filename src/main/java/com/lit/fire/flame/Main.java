@@ -6,12 +6,10 @@ import java.util.List;
 
 public class Main {
 
+    // X/Instagram/Reddit/YouTube scan() only syncs the tracked-movie list into the scanner's
+    // TrackedEntityScheduler, which polls each movie on its own adaptive interval (same policy on
+    // every platform: polling.* in application.properties). Hourly sync picks up tracking changes.
     private static final long DEFAULT_SUCCESS_DELAY_MS = 60 * 60 * 1000; // 1 hour
-    // Apify-billed scanners (Instagram/Reddit) additionally space out per-entity calls by 1 hour
-    // (see InstagramApifyService/RedditApifyService), so a single scan() pass over ~8 entities
-    // already takes ~7-8 hours; waiting another 12 hours after it completes keeps full-cycle cost
-    // down (~19-20h cadence) instead of restarting an already-hours-long pass every hour.
-    private static final long APIFY_SUCCESS_DELAY_MS = 12 * 60 * 60 * 1000; // 12 hours
     // TMDB release discovery (ReleaseDiscoveryService, writes the weekly release file) - release
     // dates move slowly, twice a day is plenty.
     private static final long DISCOVERY_SUCCESS_DELAY_MS = 12 * 60 * 60 * 1000; // 12 hours
@@ -91,8 +89,8 @@ public class Main {
         }
 
         // Same for the relevance check: movies whose X posts already look on-topic are cleared for
-        // Instagram/Reddit before those scanners' first pass (they pass only every ~12h), instead of
-        // being skipped as "awaiting relevance check" until the next one.
+        // Instagram/Reddit before those scanners' first polls, instead of being skipped as
+        // "awaiting relevance check" until the next one.
         RelevanceCheckService relevance = new RelevanceCheckService();
         try {
             relevance.scan();
@@ -111,8 +109,8 @@ public class Main {
         services.add(relevanceService);
         // Instagram/Reddit are collected via Apify Actors (InstagramApifyService/RedditApifyService),
         // not the native Graph API / Reddit OAuth clients (InstagramService/RedditAuthClientWithSearch).
-        services.add(new ScannableService(new InstagramApifyService(), "Instagram", APIFY_SUCCESS_DELAY_MS));
-        services.add(new ScannableService(new RedditApifyService(), "Reddit", APIFY_SUCCESS_DELAY_MS));
+        services.add(new ScannableService(new InstagramApifyService(), "Instagram"));
+        services.add(new ScannableService(new RedditApifyService(), "Reddit"));
         services.add(new ScannableService(createXScanner(), "X"));
         services.add(new ScannableService(new YouTubeMain(), "YouTube"));
 

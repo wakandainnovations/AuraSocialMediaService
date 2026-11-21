@@ -29,7 +29,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>The scheduled scan is a copy of XService's behaviour, built on X's own advanced-search
  * operators through the Actor "apidojo/twitter-scraper-lite":
  * <ul>
- *   <li><b>New tweets</b>: each tracked entity is polled hourly with its keywords OR'd into one query
+ *   <li><b>New tweets</b>: each tracked entity is polled on TrackedEntityScheduler's adaptive
+ *       interval (4h, backing off to 24h for quiet movies) with its keywords OR'd into one query
  *       (split into chunks past {@link #MAX_QUERY_CHARS}, as XService does) plus
  *       {@code since_id:<last saved tweet id>}, so only tweets newer than the last one seen are
  *       fetched. The since_id lives in the same x_post_ids row XService uses, so switching
@@ -81,7 +82,7 @@ public class XApifyService implements SocialMediaScanner {
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(4);
     // See XService: Main re-invokes scan() hourly, so one-time setup must not re-register the refresh.
     private final AtomicBoolean initialized = new AtomicBoolean(false);
-    private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("Aura-X/Apify", 3600, 300);
+    private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("Aura-X/Apify", 300);
 
     private static void loadConfig() {
         numberOfPosts = AppProperties.getIntProperty("x.apify.max_items",
@@ -101,7 +102,7 @@ public class XApifyService implements SocialMediaScanner {
      * With no saved id yet (first poll), fetches the latest {@code numberOfPosts} with no lower bound,
      * as XService does. The since_id is only advanced after every chunk has been saved.
      */
-    public static void poll(String entity, List<String> keywords, String category) throws Exception {
+    public static int poll(String entity, List<String> keywords, String category) throws Exception {
         String lastPostId = DatabaseService.getLastXPostId(entity);
         boolean hasSinceId = lastPostId != null && !lastPostId.trim().isEmpty()
                 && !lastPostId.equalsIgnoreCase("null");
@@ -110,6 +111,7 @@ public class XApifyService implements SocialMediaScanner {
                 + (hasSinceId ? " since tweet " + lastPostId : "") + "...");
 
         String maxNewestId = null;
+        int newPosts = 0;
         for (List<String> chunk : XService.chunkKeywords(keywords, MAX_QUERY_CHARS)) {
             String query = coreQuery(chunk) + (hasSinceId ? " since_id:" + lastPostId.trim() : "");
             JsonArray items = runScanActor("poll", entity, query, numberOfPosts);
@@ -131,11 +133,13 @@ public class XApifyService implements SocialMediaScanner {
             }
             // Pass only this chunk's keywords so matched-keyword detection stays accurate.
             DatabaseService.saveXPosts(posts, entity, chunk, category);
+            newPosts += posts.size();
         }
 
         if (maxNewestId != null) {
             DatabaseService.saveLastXPostId(entity, maxNewestId);
         }
+        return newPosts;
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -315,7 +319,7 @@ public class XApifyService implements SocialMediaScanner {
     public void scan() {
         if (initialized.compareAndSet(false, true)) {
             loadConfig();
-            System.out.println("Initializing X Apify Search (up to " + numberOfPosts + " new tweets per entity per hour)...");
+            System.out.println("Initializing X Apify Search (up to " + numberOfPosts + " new tweets per entity per poll)...");
             // Hourly metrics refresh across all previously-collected posts (tiered policy in SQL),
             // on the same schedule as XService.
             scheduler.scheduleAtFixedRate(() -> {
@@ -328,7 +332,7 @@ public class XApifyService implements SocialMediaScanner {
         }
         // Not gated on TrackedReleaseSource.isApifyEligible: RelevanceCheckService needs these X
         // posts to make that decision in the first place.
-        entitySchedule.sync(scheduler, XApifyService::poll);
+        entitySchedule.sync(scheduler, (entity, keywords, category, previousPollAt) -> poll(entity, keywords, category));
     }
 
     // ---------------------------------------------------------------------------------------------
