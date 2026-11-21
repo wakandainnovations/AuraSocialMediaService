@@ -617,8 +617,11 @@ public class XApifyService implements SocialMediaScanner {
     // Shared helpers
     // ---------------------------------------------------------------------------------------------
 
-    private static String coreQuery(List<String> keywords) {
-        return keywords.size() == 1 ? keywords.get(0) : "(" + String.join(" OR ", keywords) + ")";
+    // X binds OR tighter than the implicit AND between words, so a bare multi-word keyword inside
+    // an OR list ("A OR Minnum Oar Iravu OR B") would AND its words into the whole query; each one
+    // is parenthesised to keep it a single alternative.
+    static String coreQuery(List<String> keywords) {
+        return XService.buildQuery(keywords);
     }
 
     // Numeric comparison of tweet (snowflake) ids.

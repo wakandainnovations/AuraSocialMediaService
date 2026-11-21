@@ -203,8 +203,17 @@ public class XService implements SocialMediaScanner {
     }
 
     // Builds the OR'd recent-search query operator string for a set of keywords.
-    private static String buildQuery(List<String> keywords) {
-        return keywords.size() == 1 ? keywords.get(0) : "(" + String.join(" OR ", keywords) + ")";
+    // X binds OR tighter than the implicit AND between words, so a bare multi-word keyword inside
+    // an OR list would AND its words into the whole query; each one is parenthesised instead.
+    static String buildQuery(List<String> keywords) {
+        if (keywords.size() == 1) return keywords.get(0);
+        List<String> terms = new ArrayList<>();
+        for (String k : keywords) {
+            String t = k.trim();
+            terms.add(t.contains(" ") && !(t.startsWith("(") && t.endsWith(")")) && !(t.startsWith("\"") && t.endsWith("\""))
+                    ? "(" + t + ")" : t);
+        }
+        return "(" + String.join(" OR ", terms) + ")";
     }
 
     /**

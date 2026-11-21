@@ -74,4 +74,10 @@ public class XApifyServiceTest extends TestCase {
         assertTrue(slices.size() > 1);
         for (XApifyService.Slice slice : slices) assertTrue(slice.expectedItems() + 20 <= 200);
     }
+
+    public void testQueryParenthesisesMultiWordKeywords() {
+        assertEquals("(MinnumOarIravu OR (Minnum Oar Iravu) OR Bhogi)",
+                XApifyService.coreQuery(List.of("MinnumOarIravu", "Minnum Oar Iravu", "Bhogi")));
+        assertEquals("Minnum Oar Iravu", XApifyService.coreQuery(List.of("Minnum Oar Iravu")));
+    }
 }
