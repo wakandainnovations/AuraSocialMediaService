@@ -183,15 +183,17 @@ public class InstagramApifyService implements SocialMediaScanner {
     }
 
     /**
-     * Strips spaces and de-dupes case-insensitively (e.g. "Ayogya 2" and "Ayogya2" both normalize
-     * to the same hashtag), preserving first-seen form. Instagram hashtags can't contain spaces, so
-     * without this a "pretty" keyword variant would just waste one of the Actor's billed hashtag
-     * slots re-scraping the same tag as its space-free sibling.
+     * Strips everything but letters (incl. combining marks, so Indic scripts stay intact), digits and underscores, then de-dupes case-insensitively
+     * (e.g. "Ayogya 2" and "Ayogya2" both normalize to the same hashtag), preserving first-seen
+     * form. Instagram hashtags can't contain spaces or punctuation, and the Actor rejects the whole
+     * run (HTTP 400 invalid-input) if any hashtag contains characters like ' - : . & etc., so a
+     * title such as "Bachelor Party D'eux" must become "BachelorPartyDeux". De-duping also stops a
+     * "pretty" keyword variant from wasting one of the Actor's billed hashtag slots.
      */
     static List<String> normalizeHashtags(List<String> keywords) {
         Map<String, String> byNormalized = new LinkedHashMap<>();
         for (String kw : keywords) {
-            String compact = kw.replaceAll("\\s+", "");
+            String compact = kw.replaceAll("[^\\p{L}\\p{M}\\p{N}_]", "");
             if (compact.isEmpty()) {
                 continue;
             }
