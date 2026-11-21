@@ -3,6 +3,8 @@ package com.lit.fire.flame;
 import junit.framework.TestCase;
 
 import java.util.List;
+import java.util.Map;
+import java.util.stream.LongStream;
 
 public class XApifyServiceTest extends TestCase {
 
@@ -41,5 +43,35 @@ public class XApifyServiceTest extends TestCase {
                 member("A", idAtHour(10), longKeyword + "a"),
                 member("B", idAtHour(10), longKeyword + "b")));
         assertEquals(2, groups.size());
+    }
+
+    private static Map<String, String> due(long id) {
+        return Map.of("x_id", String.valueOf(id), "composite_id", id + "_E", "entity", "E");
+    }
+
+    public void testRefreshMergesDueTweetsWithFewSavedTweetsBetween() {
+        // Saved ids 100..199; due 100, 130, 160: 29 non-due tweets between each pair (< 40).
+        long[] saved = LongStream.range(100, 200).toArray();
+        List<XApifyService.Slice> slices = XApifyService.slices(List.of(due(160), due(100), due(130)), saved, 40, 200);
+        assertEquals(1, slices.size());
+        assertEquals(3, slices.get(0).rows().size());
+        assertEquals(61, slices.get(0).expectedItems()); // ids 100..160
+    }
+
+    public void testRefreshSplitsWhenTooManySavedTweetsBetween() {
+        // 59 non-due tweets between 100 and 160: re-reading them costs more than a new query.
+        long[] saved = LongStream.range(100, 200).toArray();
+        List<XApifyService.Slice> slices = XApifyService.slices(List.of(due(100), due(160)), saved, 40, 200);
+        assertEquals(2, slices.size());
+        assertEquals(1, slices.get(0).expectedItems());
+    }
+
+    public void testRefreshSplitsAtMaxItemsPerQuery() {
+        long[] saved = LongStream.range(0, 1000).toArray();
+        List<Map<String, String>> rows = new java.util.ArrayList<>();
+        for (long id = 0; id < 1000; id += 20) rows.add(due(id)); // 19 between each, so all would merge
+        List<XApifyService.Slice> slices = XApifyService.slices(rows, saved, 40, 200);
+        assertTrue(slices.size() > 1);
+        for (XApifyService.Slice slice : slices) assertTrue(slice.expectedItems() + 20 <= 200);
     }
 }

@@ -739,6 +739,31 @@ public class DatabaseService {
         return new ArrayList<>(keywords);
     }
 
+    // Sorted X tweet ids of an entity's saved posts created within [from, to] (epoch seconds).
+    // XApifyService's refresh uses them to estimate how many tweets an id-range search returns.
+    public static long[] getXPostIdsBetween(String entity, long fromEpochSeconds, long toEpochSeconds) {
+        String sql = "SELECT split_part(id, '_', 1) AS x_id FROM x_posts WHERE entity = ? AND created_at BETWEEN ? AND ?";
+        List<Long> ids = new ArrayList<>();
+        try (Connection conn = getConnection();
+             PreparedStatement pstmt = conn.prepareStatement(sql)) {
+            pstmt.setString(1, entity);
+            pstmt.setTimestamp(2, Timestamp.from(Instant.ofEpochSecond(fromEpochSeconds)));
+            pstmt.setTimestamp(3, Timestamp.from(Instant.ofEpochSecond(toEpochSeconds)));
+            try (ResultSet rs = pstmt.executeQuery()) {
+                while (rs.next()) {
+                    try {
+                        ids.add(Long.parseLong(rs.getString("x_id")));
+                    } catch (NumberFormatException ignored) {
+                        // not a tweet id; can't be in a since_id/max_id range anyway
+                    }
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("Database error in getXPostIdsBetween: " + e.getMessage());
+        }
+        return ids.stream().mapToLong(Long::longValue).sorted().toArray();
+    }
+
     // Bumps last_refreshed_at on every candidate row, including those X dropped (deleted/private),
     // so they don't re-enter the candidate set on the next cycle.
     public static void markRefreshAttempted(List<String> compositeIds) {

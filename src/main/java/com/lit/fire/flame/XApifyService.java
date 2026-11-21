@@ -42,11 +42,11 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *       the movies whose keywords its text contains.</li>
  *   <li><b>Likes / replies / views refresh</b>: hourly, using the same tiered candidate set and the
  *       same 100-posts-per-cycle cap as XService.refreshMetrics. Instead of a per-tweet lookup (the
- *       Actor bills $0.05 per tweet URL), due tweets are grouped per entity into short time slices
- *       and each slice's search is re-run over just its id range ({@code since_id:/max_id:}), which
- *       returns those tweets with current counts for one query fee. A slice never spans more than
- *       {@link #SLICE_GAP_SECONDS} between consecutive due tweets, so a 12-hourly cohort from days
- *       ago is never lumped into one week-wide range with today's tweets.</li>
+ *       Actor bills $0.05 per tweet URL), due tweets are grouped per entity into id-range slices
+ *       and each slice's search is re-run over just its range ({@code since_id:/max_id:}), which
+ *       returns those tweets with current counts for one query fee. Slices are as wide as is
+ *       cheaper ({@link #slices}): two due tweets share a search unless re-reading the saved
+ *       non-due tweets between them would cost more than another query.</li>
  * </ul>
  * Every Actor run is logged with its cost to x_cost_log (XCostTracker).
  * The lite Actor has no minimum-results or repeated-query restrictions (unlike tweet-scraper), but
@@ -69,12 +69,8 @@ public class XApifyService implements SocialMediaScanner {
     private static final int MAX_QUERY_CHARS = 512;
     // A shared search's keyword part, leaving room for " since_id:<19-digit id>".
     private static final int SHARED_QUERY_CHARS = MAX_QUERY_CHARS - 30;
-    // Tier A / Tier B boundary in DatabaseService.getXPostsDueForRefresh's policy.
-    private static final long TIER_A_MAX_AGE_SECONDS = 2 * 60 * 60;
     // Each query's fee already covers ~40 tweets, so never ask for fewer.
     private static final int MIN_QUERY_ITEMS = 40;
-    // Due tweets of one entity/tier further apart than this go into separate refresh slices.
-    private static final long SLICE_GAP_SECONDS = 30 * 60;
 
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ISO_LOCAL_DATE.withZone(ZoneOffset.UTC);
     // X's classic tweet timestamp format, e.g. "Wed Oct 10 20:19:24 +0000 2018".
@@ -319,8 +315,8 @@ public class XApifyService implements SocialMediaScanner {
     /**
      * Refreshes likes/replies/views on previously-collected posts (XService.refreshMetrics's
      * equivalent): the same tiered candidate set, capped at {@code refreshMaxRows} (100, like
-     * XService) per hourly cycle. Due posts are grouped by entity and tier, split into time slices,
-     * and each slice is refreshed by re-running the entity's search bounded to its tweet-id range.
+     * XService) per hourly cycle. Due posts are grouped by entity, split into cost-sized id-range
+     * slices ({@link #slices}), and each slice is refreshed by re-running the entity's search bounded to its tweet-id range.
      * At most {@code refreshMaxQueries} searches run per cycle; slices beyond that stay due.
      */
     public static void refreshMetrics() throws Exception {
@@ -330,27 +326,33 @@ public class XApifyService implements SocialMediaScanner {
             return;
         }
 
-        // Group by entity + tier, keeping the SQL's priority order (Tier A first, then longest-waiting).
-        long tierACutoff = Instant.now().getEpochSecond() - TIER_A_MAX_AGE_SECONDS;
+        // Group by entity, keeping the SQL's priority order (an entity with Tier A rows - fresh
+        // posts - comes first, then whoever has waited longest).
         Map<String, List<Map<String, String>>> groups = new LinkedHashMap<>();
         for (Map<String, String> row : due) {
-            boolean tierA = createdAt(row) > tierACutoff;
-            groups.computeIfAbsent(row.get("entity") + "\u0000" + (tierA ? "A" : "B"), k -> new ArrayList<>()).add(row);
+            groups.computeIfAbsent(row.get("entity"), k -> new ArrayList<>()).add(row);
         }
 
         Map<String, List<String>> trackedKeywords = loadTrackedKeywords();
+        int breakEven = mergeBreakEvenItems();
         int queriesUsed = 0;
         int slicesDone = 0;
         int slicesSkipped = 0;
         for (Map.Entry<String, List<Map<String, String>>> group : groups.entrySet()) {
-            String[] key = group.getKey().split("\u0000", 2);
-            String entity = key[0];
+            String entity = group.getKey();
             List<String> keywords = keywordsFor(entity, trackedKeywords);
-            for (List<Map<String, String>> slice : slices(group.getValue())) {
-                if (keywords.isEmpty()) {
-                    DatabaseService.markRefreshAttempted(compositeIds(slice));
-                    continue;
-                }
+            if (keywords.isEmpty()) {
+                DatabaseService.markRefreshAttempted(compositeIds(group.getValue()));
+                continue;
+            }
+            long from = Long.MAX_VALUE;
+            long to = Long.MIN_VALUE;
+            for (Map<String, String> row : group.getValue()) {
+                from = Math.min(from, createdAt(row));
+                to = Math.max(to, createdAt(row));
+            }
+            long[] savedIds = DatabaseService.getXPostIdsBetween(entity, from, to);
+            for (Slice slice : slices(group.getValue(), savedIds, breakEven, refreshMaxItems)) {
                 List<List<String>> chunks = XService.chunkKeywords(keywords, MAX_QUERY_CHARS);
                 if (queriesUsed + chunks.size() > refreshMaxQueries) {
                     slicesSkipped++;
@@ -358,11 +360,11 @@ public class XApifyService implements SocialMediaScanner {
                 }
                 queriesUsed += chunks.size();
                 try {
-                    refreshSlice(entity, key[1], slice, chunks);
+                    refreshSlice(entity, slice, chunks);
                     slicesDone++;
                 } catch (Exception e) {
                     // Rows stay due, so the next hourly cycle retries them.
-                    System.err.println("[Aura-X/Apify Refresh] Failed for '" + entity + "' (tier " + key[1] + "): " + e.getMessage());
+                    System.err.println("[Aura-X/Apify Refresh] Failed for '" + entity + "': " + e.getMessage());
                 }
             }
         }
@@ -370,28 +372,82 @@ public class XApifyService implements SocialMediaScanner {
                 + queriesUsed + " query(ies)" + (slicesSkipped > 0 ? ", " + slicesSkipped + " left for next cycle (query cap)" : "") + ".");
     }
 
-    // Splits one entity/tier's due rows into runs of tweets no more than SLICE_GAP_SECONDS apart.
-    private static List<List<Map<String, String>>> slices(List<Map<String, String>> rows) {
-        List<Map<String, String>> sorted = new ArrayList<>(rows);
-        sorted.sort((x, y) -> Long.compare(createdAt(x), createdAt(y)));
-        List<List<Map<String, String>>> slices = new ArrayList<>();
-        List<Map<String, String>> current = new ArrayList<>();
-        long previous = Long.MIN_VALUE;
-        for (Map<String, String> row : sorted) {
-            long t = createdAt(row);
-            if (!current.isEmpty() && t - previous > SLICE_GAP_SECONDS) {
-                slices.add(current);
-                current = new ArrayList<>();
-            }
-            current.add(row);
-            previous = t;
+    /**
+     * One refresh search: due rows plus how many tweets its id range is expected to return (the
+     * entity's saved tweets in [first due id, last due id], due or not - the search returns them all).
+     */
+    record Slice(List<Map<String, String>> rows, int expectedItems) {
+    }
+
+    // Extra items requested on top of the expected count (tweets the search finds that weren't saved,
+    // e.g. dropped by the @-handle filter).
+    private static final int REFRESH_ITEM_MARGIN = 20;
+
+    // A new query's fee buys this many tweets' worth of per-item charges (0.016 / 0.0004 = 40), so
+    // widening a slice over fewer non-due tweets than this is cheaper than starting another query.
+    private static int mergeBreakEvenItems() {
+        double perQuery = doubleProperty("x.apify.cost.per_query_usd", 0.016);
+        double perItem = doubleProperty("x.apify.cost.per_item_usd", 0.0004);
+        return perItem <= 0 ? Integer.MAX_VALUE : (int) Math.round(perQuery / perItem);
+    }
+
+    private static double doubleProperty(String key, double defaultValue) {
+        String v = AppProperties.getProperty(key);
+        try {
+            return v == null ? defaultValue : Double.parseDouble(v.trim());
+        } catch (NumberFormatException e) {
+            return defaultValue;
         }
-        if (!current.isEmpty()) slices.add(current);
+    }
+
+    /**
+     * Splits one entity's due rows (in tweet-id order) into as few id-range searches as is cheaper:
+     * the next due tweet joins the current slice when fewer than {@code breakEvenItems} saved
+     * non-due tweets lie between it and the slice's last due tweet (re-reading those costs less than
+     * another query) and the widened range still fits {@code maxItemsPerQuery}.
+     */
+    static List<Slice> slices(List<Map<String, String>> rows, long[] savedIds, int breakEvenItems, int maxItemsPerQuery) {
+        List<Map<String, String>> sorted = new ArrayList<>(rows);
+        sorted.sort((x, y) -> compareIds(x.get("x_id"), y.get("x_id")));
+        List<Slice> slices = new ArrayList<>();
+        List<Map<String, String>> current = new ArrayList<>();
+        long start = 0;
+        long last = 0;
+        for (Map<String, String> row : sorted) {
+            long id = Long.parseLong(row.get("x_id"));
+            if (!current.isEmpty()) {
+                int between = countIdsIn(savedIds, last + 1, id - 1);
+                int widened = Math.max(countIdsIn(savedIds, start, id), current.size() + 1);
+                if (between >= breakEvenItems || widened + REFRESH_ITEM_MARGIN > maxItemsPerQuery) {
+                    slices.add(new Slice(current, Math.max(countIdsIn(savedIds, start, last), current.size())));
+                    current = new ArrayList<>();
+                }
+            }
+            if (current.isEmpty()) start = id;
+            current.add(row);
+            last = id;
+        }
+        if (!current.isEmpty()) slices.add(new Slice(current, Math.max(countIdsIn(savedIds, start, last), current.size())));
         return slices;
     }
 
-    private static void refreshSlice(String entity, String tier, List<Map<String, String>> rows,
-                                     List<List<String>> chunks) throws Exception {
+    // Number of ids in the sorted array within [from, to].
+    private static int countIdsIn(long[] sortedIds, long from, long to) {
+        if (to < from) return 0;
+        return lowerBound(sortedIds, to + 1) - lowerBound(sortedIds, from);
+    }
+
+    private static int lowerBound(long[] a, long key) {
+        int lo = 0, hi = a.length;
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (a[mid] < key) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+
+    private static void refreshSlice(String entity, Slice slice, List<List<String>> chunks) throws Exception {
+        List<Map<String, String>> rows = slice.rows();
         String minId = null;
         String maxId = null;
         for (Map<String, String> row : rows) {
@@ -401,7 +457,7 @@ public class XApifyService implements SocialMediaScanner {
         }
         // since_id is exclusive, max_id inclusive: [minId, maxId] covers exactly the slice.
         String range = " since_id:" + new BigInteger(minId).subtract(BigInteger.ONE) + " max_id:" + maxId;
-        int maxItems = Math.min(refreshMaxItems, Math.max(MIN_QUERY_ITEMS, rows.size() + 20));
+        int maxItems = Math.min(refreshMaxItems, Math.max(MIN_QUERY_ITEMS, slice.expectedItems() + REFRESH_ITEM_MARGIN));
 
         Map<String, int[]> metricsByXId = new HashMap<>();
         // Tweets older than this weren't reached because a chunk's results hit maxItems; they stay due
@@ -431,7 +487,7 @@ public class XApifyService implements SocialMediaScanner {
                 attempted.add(row.get("composite_id"));
             }
         }
-        System.out.println("[Aura-X/Apify Refresh] '" + entity + "' tier " + tier + ": " + rows.size()
+        System.out.println("[Aura-X/Apify Refresh] '" + entity + "': " + rows.size()
                 + " due, " + metricsByXId.size() + " tweet(s) returned with fresh counts.");
         // As in XService: mark every covered candidate first (deleted/private tweets simply don't come
         // back and shouldn't re-enter next cycle), then write the fresh counts.
