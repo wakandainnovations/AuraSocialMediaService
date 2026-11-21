@@ -161,15 +161,38 @@ public class XApifyService implements SocialMediaScanner {
     record Member(String entity, List<String> keywords, String category, String sinceId) {
     }
 
-    /**
-     * Greedily packs members into shared searches, newest since_id first, so members with similar
-     * since_ids share a query: a query is bounded by its oldest member's since_id, and every tweet
-     * the newer members already have between the two is billed again. A group is closed when the
-     * next member's keywords don't fit in the query or its since_id is more than
-     * {@code x.apify.batch.max_since_gap_hours} older than the group's newest.
-     */
+    /** How many tweets a member already has saved after {@code fromSinceId} (up to its own since_id). */
+    interface ReReads {
+        int count(Member member, String fromSinceId);
+    }
+
     static List<List<Member>> packMembers(List<Member> members) {
-        long maxGapMs = AppProperties.getIntProperty("x.apify.batch.max_since_gap_hours", 6) * 3600_000L;
+        return packMembers(members, XApifyService::savedTweetsSince, mergeBreakEvenItems());
+    }
+
+    // Saved tweets of the member with fromSinceId < id <= member.sinceId(): what a shared query
+    // starting at fromSinceId re-reads (and bills) for it.
+    private static int savedTweetsSince(Member m, String fromSinceId) {
+        if (compareIds(fromSinceId, m.sinceId()) >= 0) return 0;
+        long from = new BigInteger(fromSinceId).longValue();
+        long to = new BigInteger(m.sinceId()).longValue();
+        int n = 0;
+        for (long id : DatabaseService.getXPostIdsBetween(m.entity(),
+                tweetTimeMs(fromSinceId) / 1000 - 1, tweetTimeMs(m.sinceId()) / 1000 + 1)) {
+            if (id > from && id <= to) n++;
+        }
+        return n;
+    }
+
+    /**
+     * Greedily packs members into shared searches, newest since_id first. A query is bounded by its
+     * oldest member's since_id, so every tweet the newer members already saved after it is read and
+     * billed again. A member joins the current group only when its keywords fit in the query and
+     * the group's re-reads, counting from that member's since_id, stay below {@code breakEven}
+     * tweets (the price of one more query, 40 at $0.016/query and $0.0004/tweet). Otherwise
+     * it starts a new group.
+     */
+    static List<List<Member>> packMembers(List<Member> members, ReReads reReads, int breakEven) {
         List<Member> sorted = new ArrayList<>(members);
         sorted.sort((a, b) -> compareIds(b.sinceId(), a.sinceId()));
         List<List<Member>> groups = new ArrayList<>();
@@ -179,9 +202,13 @@ public class XApifyService implements SocialMediaScanner {
             Set<String> candidate = new LinkedHashSet<>(currentKeywords);
             candidate.addAll(m.keywords());
             boolean fits = coreQuery(new ArrayList<>(candidate)).length() <= SHARED_QUERY_CHARS;
-            boolean close = current.isEmpty()
-                    || tweetTimeMs(current.get(0).sinceId()) - tweetTimeMs(m.sinceId()) <= maxGapMs;
-            if (!current.isEmpty() && (!fits || !close)) {
+            boolean cheap = true;
+            if (fits && !current.isEmpty()) {
+                int extra = 0;
+                for (Member c : current) extra += reReads.count(c, m.sinceId());
+                cheap = extra < breakEven;
+            }
+            if (!current.isEmpty() && (!fits || !cheap)) {
                 groups.add(current);
                 current = new ArrayList<>();
                 candidate = new LinkedHashSet<>(m.keywords());
@@ -217,11 +244,14 @@ public class XApifyService implements SocialMediaScanner {
 
         Map<String, TrackedEntityScheduler.PollResult> results = new LinkedHashMap<>();
         Set<String> matchedIds = new HashSet<>();
+        Set<String> mentionedIds = new HashSet<>();
         for (Member m : group) {
             JsonArray posts = new JsonArray();
             for (JsonObject post : tweets) {
                 String id = post.get("id").getAsString();
-                if (compareIds(id, m.sinceId()) <= 0 || !mentionsAny(post.get("text").getAsString(), m.keywords())) continue;
+                if (!mentionsAny(post.get("text").getAsString(), m.keywords())) continue;
+                mentionedIds.add(id);
+                if (compareIds(id, m.sinceId()) <= 0) continue; // already saved by an earlier poll
                 posts.add(post);
                 matchedIds.add(id);
             }
@@ -236,9 +266,13 @@ public class XApifyService implements SocialMediaScanner {
             System.out.println("[Apify/X] '" + m.entity() + "': " + posts.size() + " new tweet(s) from the shared search.");
             results.put(m.entity(), TrackedEntityScheduler.PollResult.of(posts.size(), capped));
         }
-        long unmatched = tweets.stream().filter(t -> !matchedIds.contains(t.get("id").getAsString())).count();
+        long alreadySaved = mentionedIds.stream().filter(id -> !matchedIds.contains(id)).count();
+        long unmatched = tweets.stream().filter(t -> !mentionedIds.contains(t.get("id").getAsString())).count();
+        if (alreadySaved > 0) {
+            System.out.println("[Apify/X] " + alreadySaved + " tweet(s) were already saved (re-read because the search starts at the oldest movie's last tweet); skipped.");
+        }
         if (unmatched > 0) {
-            System.out.println("[Apify/X] " + unmatched + " tweet(s) matched no movie's keywords in their text; dropped.");
+            System.out.println("[Apify/X] " + unmatched + " tweet(s) don't name any movie in their text (e.g. replies X matched by conversation); dropped.");
         }
         return results;
     }

@@ -26,22 +26,35 @@ public class XApifyServiceTest extends TestCase {
         assertFalse(XApifyService.mentionsAny(null, List.of("KGF")));
     }
 
-    public void testPacksMembersWithCloseSinceIdsTogether() {
+    public void testSplitsGroupsWhenReReadsCostMoreThanAQuery() {
+        // Re-reads counted from a since_id: A has 10 tweets saved after B's, 50 after C's.
+        XApifyService.ReReads reReads = (m, from) -> {
+            if (!m.entity().equals("A")) return 0;
+            return from.equals(idAtHour(18)) ? 10 : 50;
+        };
         List<List<XApifyService.Member>> groups = XApifyService.packMembers(List.of(
                 member("A", idAtHour(20), "Alpha"),
                 member("B", idAtHour(18), "Bravo"),
-                member("C", idAtHour(2), "Charlie")));
-        // A and B are 2h apart (within 6h); C is 18h older than A and goes on its own.
+                member("C", idAtHour(2), "Charlie")), reReads, 40);
+        // B costs 10 re-reads (< 40) and joins A; C would cost 50 and goes on its own.
         assertEquals(2, groups.size());
         assertEquals(List.of("A", "B"), groups.get(0).stream().map(XApifyService.Member::entity).toList());
         assertEquals(List.of("C"), groups.get(1).stream().map(XApifyService.Member::entity).toList());
+    }
+
+    public void testQuietMoviesShareEvenWhenFarApart() {
+        // No re-reads (the newer movie saved nothing in between), so an 18h gap doesn't matter.
+        List<List<XApifyService.Member>> groups = XApifyService.packMembers(List.of(
+                member("A", idAtHour(20), "Alpha"),
+                member("C", idAtHour(2), "Charlie")), (m, from) -> 0, 40);
+        assertEquals(1, groups.size());
     }
 
     public void testSplitsGroupsAtQueryLengthLimit() {
         String longKeyword = "x".repeat(300);
         List<List<XApifyService.Member>> groups = XApifyService.packMembers(List.of(
                 member("A", idAtHour(10), longKeyword + "a"),
-                member("B", idAtHour(10), longKeyword + "b")));
+                member("B", idAtHour(10), longKeyword + "b")), (m, from) -> 0, 40);
         assertEquals(2, groups.size());
     }
 
