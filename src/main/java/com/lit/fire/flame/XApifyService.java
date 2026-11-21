@@ -118,7 +118,9 @@ public class XApifyService implements SocialMediaScanner {
      * already have a saved tweet id are packed into shared searches: their keywords OR'd into one
      * query of at most {@link #MAX_QUERY_CHARS}, bounded by the oldest member's since_id, and each
      * returned tweet is saved under every member whose keywords it contains. A first poll (no
-     * since_id yet) or a keyword list too long to share a query is polled on its own.
+     * since_id yet) or a keyword list too long to share a query is polled on its own. When a shared
+     * search hits its result cap, each member's unreached older tweets are fetched by a gap search,
+     * and the busiest member is polled on its own next time.
      */
     static Map<String, TrackedEntityScheduler.PollResult> pollDue(List<TrackedEntityScheduler.Due> due) {
         Map<String, TrackedEntityScheduler.PollResult> results = new LinkedHashMap<>();
@@ -133,7 +135,8 @@ public class XApifyService implements SocialMediaScanner {
         for (TrackedEntityScheduler.Due d : due) {
             String sinceId = validSinceId(DatabaseService.getLastXPostId(d.entity()));
             List<String> keywords = distinct(d.keywords());
-            if (sinceId == null || coreQuery(keywords).length() > SHARED_QUERY_CHARS || due.size() == 1) {
+            boolean crowded = SEARCH_ALONE_NEXT.remove(d.entity());
+            if (sinceId == null || coreQuery(keywords).length() > SHARED_QUERY_CHARS || due.size() == 1 || crowded) {
                 try {
                     results.put(d.entity(), poll(d.entity(), d.keywords(), d.category()));
                 } catch (Exception e) {
@@ -156,6 +159,10 @@ public class XApifyService implements SocialMediaScanner {
         }
         return results;
     }
+
+    // Movies that filled a shared search's result cap; their next poll runs on its own so they
+    // don't crowd the other movies out again.
+    private static final Set<String> SEARCH_ALONE_NEXT = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     // An entity in a shared search, with its last saved tweet id.
     record Member(String entity, List<String> keywords, String category, String sinceId) {
@@ -235,12 +242,17 @@ public class XApifyService implements SocialMediaScanner {
 
         List<JsonObject> tweets = new ArrayList<>();
         String newestReturned = null;
+        String oldestReturned = null;
         for (JsonElement el : items) {
             JsonObject post = toXPost(el.getAsJsonObject());
             if (post == null) continue;
             tweets.add(post);
-            newestReturned = XService.maxId(newestReturned, post.get("id").getAsString());
+            String id = post.get("id").getAsString();
+            newestReturned = XService.maxId(newestReturned, id);
+            oldestReturned = oldestReturned == null || compareIds(id, oldestReturned) < 0 ? id : oldestReturned;
         }
+        String busiest = null;
+        int busiestCount = -1;
 
         Map<String, TrackedEntityScheduler.PollResult> results = new LinkedHashMap<>();
         Set<String> matchedIds = new HashSet<>();
@@ -258,13 +270,41 @@ public class XApifyService implements SocialMediaScanner {
             if (posts.size() > 0) {
                 DatabaseService.saveXPosts(posts, m.entity(), m.keywords(), m.category());
             }
-            // The search covered every member's keywords up to the newest tweet it returned, so each
-            // member resumes from there - a quiet member doesn't hold every shared query back.
+            System.out.println("[Apify/X] '" + m.entity() + "': " + posts.size() + " new tweet(s) from the shared search.");
+            int newCount = posts.size();
+            boolean memberCapped = false;
+            if (capped && compareIds(oldestReturned, m.sinceId()) > 0) {
+                // The search hit its cap, so it only reached back to oldestReturned: this member's
+                // tweets between its own since_id and there weren't fetched. Fetch that gap on its own.
+                try {
+                    int[] gap = fetchGap(m, oldestReturned);
+                    newCount += gap[0];
+                    memberCapped = gap[1] == 1;
+                } catch (Exception e) {
+                    // Keep the old since_id so the next poll covers the gap (saving is idempotent).
+                    System.err.println("[Apify/X] Gap search failed for '" + m.entity() + "': " + e.getMessage());
+                    results.put(m.entity(), TrackedEntityScheduler.PollResult.FAILED);
+                    continue;
+                }
+            }
+            // Every tweet up to the newest one returned is now covered for this member (by the shared
+            // search, or the gap search), so it resumes from there - a quiet member doesn't hold every
+            // shared query back.
             if (newestReturned != null && compareIds(newestReturned, m.sinceId()) > 0) {
                 DatabaseService.saveLastXPostId(m.entity(), newestReturned);
             }
-            System.out.println("[Apify/X] '" + m.entity() + "': " + posts.size() + " new tweet(s) from the shared search.");
-            results.put(m.entity(), TrackedEntityScheduler.PollResult.of(posts.size(), capped));
+            if (newCount > busiestCount) {
+                busiest = m.entity();
+                busiestCount = newCount;
+            }
+            results.put(m.entity(), TrackedEntityScheduler.PollResult.of(newCount, memberCapped));
+        }
+        if (capped && busiest != null) {
+            // The movie that filled the cap backs off like a capped single poll, and searches alone next time.
+            SEARCH_ALONE_NEXT.add(busiest);
+            results.put(busiest, TrackedEntityScheduler.PollResult.of(busiestCount, true));
+            System.out.println("[Apify/X] Shared search hit its " + numberOfPosts + "-tweet cap; '" + busiest
+                    + "' (busiest) will be searched on its own next time.");
         }
         long alreadySaved = mentionedIds.stream().filter(id -> !matchedIds.contains(id)).count();
         long unmatched = tweets.stream().filter(t -> !mentionedIds.contains(t.get("id").getAsString())).count();
@@ -275,6 +315,29 @@ public class XApifyService implements SocialMediaScanner {
             System.out.println("[Apify/X] " + unmatched + " tweet(s) don't name any movie in their text (e.g. replies X matched by conversation); dropped.");
         }
         return results;
+    }
+
+    /**
+     * After a capped shared search, fetches one member's tweets older than the oldest tweet the
+     * shared search returned, back to the member's own since_id (since_id exclusive, max_id
+     * inclusive). Returns {saved count, 1 if this search also hit the cap else 0}.
+     */
+    private static int[] fetchGap(Member m, String oldestReturned) throws Exception {
+        String maxId = new BigInteger(oldestReturned).subtract(BigInteger.ONE).toString();
+        String query = coreQuery(m.keywords()) + " since_id:" + m.sinceId() + " max_id:" + maxId;
+        System.out.println("[Apify/X] Gap search for '" + m.entity() + "' (shared search hit its cap).");
+        JsonArray items = runScanActor("poll", m.entity(), query, numberOfPosts);
+        JsonArray posts = new JsonArray();
+        for (JsonElement el : items) {
+            JsonObject post = toXPost(el.getAsJsonObject());
+            if (post == null) continue;
+            String id = post.get("id").getAsString();
+            if (compareIds(id, m.sinceId()) <= 0 || compareIds(id, oldestReturned) >= 0) continue;
+            posts.add(post);
+        }
+        if (posts.size() > 0) DatabaseService.saveXPosts(posts, m.entity(), m.keywords(), m.category());
+        System.out.println("[Apify/X] '" + m.entity() + "': " + posts.size() + " more tweet(s) from the gap search.");
+        return new int[]{posts.size(), items.size() >= numberOfPosts ? 1 : 0};
     }
 
     /**
