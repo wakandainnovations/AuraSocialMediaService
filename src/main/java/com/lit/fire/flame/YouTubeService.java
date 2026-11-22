@@ -58,7 +58,10 @@ public class YouTubeService {
      *
      * @param queryTerm The term to search for.
      * @param maxResults The maximum number of results to return (1-50).
-     * @return A list of SearchResult objects, or an empty list if no results are found or an error occurs.
+     * @return A list of SearchResult objects, or an empty list if YouTube found no videos.
+     * @throws YouTubeQuotaExceededException if the Data API quota or rate limit is exhausted.
+     * @throws RuntimeException for any other failed search, so callers can tell a failure from
+     *         "no videos" instead of treating a failed poll as a quiet one.
      */
     public List<SearchResult> searchVideos(String queryTerm, long maxResults) {
         return searchVideos(queryTerm, maxResults, null);
@@ -106,15 +109,20 @@ public class YouTubeService {
                 return items;
             }
 
+        } catch (GoogleJsonResponseException e) {
+            if (isQuotaExceeded(e)) {
+                throw new YouTubeQuotaExceededException("YouTube API quota exceeded while searching '" + queryTerm + "'", e);
+            }
+            throw new RuntimeException("YouTube search for '" + queryTerm + "' failed: HTTP " + e.getStatusCode()
+                    + (e.getDetails() != null ? " " + e.getDetails().getMessage() : ""), e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("YouTube search for '" + queryTerm + "' interrupted", e);
         } catch (IOException e) {
-            System.err.println("An IO error occurred: " + e.getMessage());
-            e.printStackTrace();
-        } catch (Exception e) {
-            System.err.println("An unexpected error occurred during the search: " + e.getMessage());
-            e.printStackTrace();
+            throw new RuntimeException("YouTube search for '" + queryTerm + "' failed: " + e.getMessage(), e);
         }
 
-        // Return an empty list in case of errors or no results.
+        // YouTube returned no items: genuinely no videos.
         return Collections.emptyList();
     }
 

@@ -1,6 +1,5 @@
 package com.lit.fire.flame;
 
-import com.google.api.client.googleapis.json.GoogleJsonResponseException;
 import com.google.api.services.youtube.model.CommentSnippet;
 import com.google.api.services.youtube.model.CommentThread;
 import com.google.api.services.youtube.model.SearchResult;
@@ -94,7 +93,27 @@ public class YouTubeMain implements SocialMediaScanner {
                 + "' (keywords: " + String.join(", ", keywords) + ")...");
 
         YouTubeService service = new YouTubeService("YouTubeSearchApp", API_KEY);
-        List<SearchResult> videos = service.searchVideos(combinedQuery, maxVideos, publishedAfter);
+        // Data API first (free within quota); if its search fails for any reason, Apify's YouTube
+        // search. If both fail the exception propagates, so the scheduler counts a failed poll
+        // (retried at the base interval) instead of a quiet one that backs off.
+        List<SearchResult> videos;
+        Map<String, Video> apifyStats = Map.of();
+        boolean youtubeApiQuotaExceeded = false;
+        try {
+            videos = service.searchVideos(combinedQuery, maxVideos, publishedAfter);
+        } catch (RuntimeException apiError) {
+            youtubeApiQuotaExceeded = apiError instanceof YouTubeQuotaExceededException;
+            System.err.println(apiError.getMessage() + ". Falling back to Apify YouTube search.");
+            YouTubeVideoSearchApifyService.Result fallback;
+            try {
+                fallback = YouTubeVideoSearchApifyService.search(keywords, maxVideos, publishedAfter);
+            } catch (Exception apifyError) {
+                throw new RuntimeException("YouTube search failed on the Data API (" + apiError.getMessage()
+                        + ") and on Apify (" + apifyError.getMessage() + ")", apifyError);
+            }
+            videos = fallback.videos();
+            apifyStats = fallback.stats();
+        }
 
         if (videos.isEmpty()) {
             System.out.println("No videos found for entity: '" + entity + "'");
@@ -107,10 +126,9 @@ public class YouTubeMain implements SocialMediaScanner {
         Set<String> seenVideoIds = new HashSet<>();
         // Keeps first-seen order/snippet for the like/view/comment-count upsert below.
         Map<String, SearchResult> uniqueVideos = new LinkedHashMap<>();
-        // Once the Data API's quota is hit for one video, every other call in this run will fail
-        // the same way; the rest of this run's videos go straight to the Apify fallback instead of
-        // wasting a doomed API call first.
-        boolean youtubeApiQuotaExceeded = false;
+        // Once the Data API's quota is hit (by the search above or by one video's comments), every
+        // other call in this run will fail the same way; the rest of this run's videos go straight
+        // to the Apify fallback instead of wasting a doomed API call first.
 
         for (SearchResult video : videos) {
             String videoId = video.getId().getVideoId();
@@ -165,7 +183,11 @@ public class YouTubeMain implements SocialMediaScanner {
         }
 
         if (!uniqueVideos.isEmpty()) {
-            Map<String, Video> statsByVideoId = service.getVideoStatistics(new ArrayList<>(uniqueVideos.keySet()));
+            // Without quota the stats call returns nothing; use the counts Apify's search returned,
+            // so the upsert doesn't overwrite stored counts with blanks.
+            Map<String, Video> statsByVideoId = youtubeApiQuotaExceeded ? new java.util.HashMap<>()
+                    : service.getVideoStatistics(new ArrayList<>(uniqueVideos.keySet()));
+            apifyStats.forEach(statsByVideoId::putIfAbsent);
             JsonArray videoDocs = new JsonArray();
 
             for (Map.Entry<String, SearchResult> entry : uniqueVideos.entrySet()) {
@@ -240,11 +262,6 @@ public class YouTubeMain implements SocialMediaScanner {
 
     @Override
     public void scan() {
-        if (scheduler.isShutdown()) {
-            // Quota exhaustion shut the scheduler down (see below); it stays down until restart.
-            System.out.println("YouTube scheduler is shut down (API quota exhausted); skipping entity sync.");
-            return;
-        }
         try {
             loadConfig();
             System.out.println("Syncing YouTube entity polls...");
@@ -252,19 +269,10 @@ public class YouTubeMain implements SocialMediaScanner {
             // one adaptive poll per entity (TrackedEntityScheduler: 4h, backing off to 24h when
             // quiet), keywords combined into one OR'd video search so a shared video's comments are
             // read/stored once.
-            entitySchedule.sync(scheduler, (entity, keywords, category, previousPollAt) -> {
-                try {
-                    return TrackedEntityScheduler.PollResult.of(search(entity, keywords, category, numberOfVideos, null, previousPollAt));
-                } catch (GoogleJsonResponseException e) {
-                    if (e.getDetails() != null && e.getDetails().getCode() == 403
-                            && e.getDetails().getMessage() != null && e.getDetails().getMessage().contains("quota")) {
-                        System.err.println("YouTube API quota exceeded. Shutting down all tasks.");
-                        scheduler.shutdown();
-                        return TrackedEntityScheduler.PollResult.SKIPPED;
-                    }
-                    throw e; // logged by the scheduler, retried after the base interval
-                }
-            });
+            // Data API quota/rate limits fall back to Apify inside search(); anything it still throws
+            // is logged by the scheduler as a failed poll and retried after the base interval.
+            entitySchedule.sync(scheduler, (entity, keywords, category, previousPollAt) ->
+                    TrackedEntityScheduler.PollResult.of(search(entity, keywords, category, numberOfVideos, null, previousPollAt)));
         } catch (Exception e) {
             System.err.println("An unrecoverable error occurred during the process.");
             e.printStackTrace();
