@@ -52,38 +52,19 @@ public class ApifyClient {
         }
     }
 
+    // How long runActorAndGetDatasetItems waits for a run (Reddit, Instagram, YouTube). Apify's
+    // synchronous run-sync endpoint gives up after 300s, which slow multi-keyword Reddit searches
+    // (Maarige Daari: 230-280s of run time plus start-up) kept exceeding, so the run is started and
+    // polled instead.
+    private static final Duration SYNC_RUN_DEADLINE = Duration.ofSeconds(600);
+
     /**
-     * Runs the given Actor (e.g. "breathtaking_anthem/instagram-hashtag-posts-scraper") synchronously
-     * with the supplied input and returns the resulting dataset items as a JsonArray.
+     * Runs the given Actor (e.g. "breathtaking_anthem/instagram-hashtag-posts-scraper") with the
+     * supplied input, waits up to {@link #SYNC_RUN_DEADLINE} for it to finish, and returns the
+     * resulting dataset items as a JsonArray. A run still going at the deadline is aborted and throws.
      */
     public static JsonArray runActorAndGetDatasetItems(String actorId, JsonObject input) throws Exception {
-        String token = loadApiToken();
-        // The REST API addresses an Actor as "owner~name" rather than "owner/name".
-        String encodedActorId = actorId.replace("/", "~");
-        String url = API_BASE_URL + "/actors/" + encodedActorId + "/run-sync-get-dataset-items?format=json";
-
-        HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(30))
-                .build();
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(REQUEST_TIMEOUT)
-                .header("Authorization", "Bearer " + token)
-                .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(input.toString(), StandardCharsets.UTF_8))
-                .build();
-
-        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() < 200 || response.statusCode() >= 300) {
-            throw new RuntimeException("Apify Actor run failed for '" + actorId + "'. Status: " + response.statusCode() + ", Body: " + response.body());
-        }
-
-        String body = response.body();
-        if (body == null || body.isBlank()) {
-            return new JsonArray();
-        }
-        return JsonParser.parseString(body).getAsJsonArray();
+        return runActor(actorId, input, SYNC_RUN_DEADLINE).items();
     }
 
     /** Dataset items of a finished run, plus the run object (id, status, pricingInfo, chargedEventCounts). */
@@ -102,6 +83,11 @@ public class ApifyClient {
      * synchronous endpoint doesn't return. Used where spend is tracked (XApifyService).
      */
     public static RunResult runActor(String actorId, JsonObject input) throws Exception {
+        return runActor(actorId, input, RUN_DEADLINE);
+    }
+
+    /** {@link #runActor(String, JsonObject)} with its own wait limit. */
+    public static RunResult runActor(String actorId, JsonObject input, Duration runDeadline) throws Exception {
         String token = loadApiToken();
         String encodedActorId = actorId.replace("/", "~");
         HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
@@ -111,7 +97,7 @@ public class ApifyClient {
                 .uri(URI.create(API_BASE_URL + "/acts/" + encodedActorId + "/runs?waitForFinish=60"))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(input.toString(), StandardCharsets.UTF_8)), token, actorId);
-        long deadline = System.currentTimeMillis() + RUN_DEADLINE.toMillis();
+        long deadline = System.currentTimeMillis() + runDeadline.toMillis();
         while (isRunning(run)) {
             if (System.currentTimeMillis() > deadline) {
                 String runId = run.get("id").getAsString();
@@ -123,7 +109,7 @@ public class ApifyClient {
                     // Best effort; the timeout below is what matters to the caller.
                 }
                 throw new RuntimeException("Apify Actor run " + runId + " for '" + actorId + "' did not finish within "
-                        + RUN_DEADLINE.toMinutes() + " minutes; aborted.");
+                        + runDeadline.toSeconds() + "s; aborted.");
             }
             run = sendJson(client, HttpRequest.newBuilder()
                     .uri(URI.create(API_BASE_URL + "/actor-runs/" + run.get("id").getAsString() + "?waitForFinish=60"))
