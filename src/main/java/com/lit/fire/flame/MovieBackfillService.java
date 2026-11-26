@@ -50,7 +50,7 @@ public class MovieBackfillService {
         System.out.println("[MovieBackfill] Starting one-time backfill for '" + entity + "' -> keywords " + keywords
                 + ", past " + months + " month(s) (since " + cutoff + ")...");
 
-        try {
+        if (AppProperties.isPlatformEnabled("instagram")) try {
             InstagramApifyService.search(entity, keywords, category, instagramLimit, cutoff);
         } catch (Exception e) {
             System.err.println("[MovieBackfill] Instagram failed for '" + entity + "': " + e.getMessage());
@@ -58,7 +58,7 @@ public class MovieBackfillService {
         }
         sleep();
 
-        try {
+        if (AppProperties.isPlatformEnabled("reddit")) try {
             RedditApifyService.search(entity, keywords, category, redditLimit, redditDateFrom, null);
         } catch (Exception e) {
             System.err.println("[MovieBackfill] Reddit failed for '" + entity + "': " + e.getMessage());
@@ -66,7 +66,13 @@ public class MovieBackfillService {
         }
         sleep();
 
-        try {
+        // X backfill only exists through the Apify scraper (the official API's search covers the last 7
+        // days, which the scheduled scan already reads), so it's skipped when x.provider=api.
+        boolean xApify = !"api".equalsIgnoreCase(String.valueOf(AppProperties.getProperty("x.provider")).trim());
+        if (AppProperties.isPlatformEnabled("x") && !xApify) {
+            System.out.println("[MovieBackfill] X skipped: x.provider=api, and the scheduled X scan covers the last 7 days.");
+        }
+        if (AppProperties.isPlatformEnabled("x") && xApify) try {
             XApifyService.search(entity, keywords, category, xLimit, cutoff, null);
         } catch (Exception e) {
             System.err.println("[MovieBackfill] X failed for '" + entity + "': " + e.getMessage());
@@ -74,7 +80,7 @@ public class MovieBackfillService {
         }
         sleep();
 
-        try {
+        if (AppProperties.isPlatformEnabled("youtube")) try {
             YouTubeMain.loadConfig();
             YouTubeMain.search(entity, keywords, category, youtubeLimit, cutoff);
         } catch (Exception e) {

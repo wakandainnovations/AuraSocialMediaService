@@ -109,10 +109,21 @@ public class Main {
         services.add(relevanceService);
         // Instagram/Reddit are collected via Apify Actors (InstagramApifyService/RedditApifyService),
         // not the native Graph API / Reddit OAuth clients (InstagramService/RedditAuthClientWithSearch).
-        services.add(new ScannableService(new InstagramApifyService(), "Instagram"));
-        services.add(new ScannableService(new RedditApifyService(), "Reddit"));
-        services.add(new ScannableService(createXScanner(), "X"));
-        services.add(new ScannableService(new YouTubeMain(), "YouTube"));
+        // scan.platforms (application.properties) picks which platforms are collected; the rest are paused.
+        if (AppProperties.isPlatformEnabled("instagram")) {
+            services.add(new ScannableService(new InstagramApifyService(), "Instagram"));
+        }
+        if (AppProperties.isPlatformEnabled("reddit")) {
+            services.add(new ScannableService(new RedditApifyService(), "Reddit"));
+        }
+        if (AppProperties.isPlatformEnabled("x")) {
+            services.add(new ScannableService(createXScanner(), "X"));
+        }
+        if (AppProperties.isPlatformEnabled("youtube")) {
+            services.add(new ScannableService(new YouTubeMain(), "YouTube"));
+        }
+        System.out.println("Collecting from: " + AppProperties.getProperty("scan.platforms")
+                + " (scan.platforms; unset = all).");
 
         for (ScannableService service : services) {
             new Thread(service).start();
