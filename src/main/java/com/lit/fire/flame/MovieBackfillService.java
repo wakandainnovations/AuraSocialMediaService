@@ -67,10 +67,12 @@ public class MovieBackfillService {
         sleep();
 
         // X backfill only exists through the Apify scraper (the official API's search covers the last 7
-        // days, which the scheduled scan already reads), so it's skipped when x.provider=api.
-        boolean xApify = !"api".equalsIgnoreCase(String.valueOf(AppProperties.getProperty("x.provider")).trim());
+        // days, which the scheduled scan already reads), so it only runs when x.provider=apify (the
+        // default). With "api" or "api-apify" the X API is the main source and backfill skips X.
+        String xProvider = AppProperties.getProperty("x.provider");
+        boolean xApify = xProvider == null || xProvider.trim().equalsIgnoreCase("apify");
         if (AppProperties.isPlatformEnabled("x") && !xApify) {
-            System.out.println("[MovieBackfill] X skipped: x.provider=api, and the scheduled X scan covers the last 7 days.");
+            System.out.println("[MovieBackfill] X skipped: x.provider=" + xProvider.trim() + ", and the scheduled X scan covers the last 7 days.");
         }
         if (AppProperties.isPlatformEnabled("x") && xApify) try {
             XApifyService.search(entity, keywords, category, xLimit, cutoff, null);

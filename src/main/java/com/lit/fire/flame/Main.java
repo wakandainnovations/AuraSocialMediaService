@@ -59,7 +59,8 @@ public class Main {
 
     // x.provider picks the X/Twitter source: "apify" (default, XApifyService - Apify's tweet scraper,
     // much cheaper; XProviderFailover switches to XService while the scraper can't search and back
-    // once it can) or "api" (XService only - the official X API v2, billed per post read).
+    // once it can), "api" (XService only - the official X API v2, billed per post read) or "api-apify"
+    // (XService, moving to Apify while the X API answers 402 "credits depleted" - XApiFirstFailover).
     private static SocialMediaScanner createXScanner() {
         String provider = AppProperties.getProperty("x.provider");
         provider = provider == null ? "apify" : provider.trim().toLowerCase();
@@ -67,6 +68,9 @@ public class Main {
             case "api":
                 System.out.println("X provider: official X API v2 (XService).");
                 return new XService();
+            case "api-apify":
+                System.out.println("X provider: official X API v2 (XService), falling back to the Apify scraper while the X API has no credits.");
+                return new XApiFirstFailover();
             case "apify":
                 System.out.println("X provider: Apify tweet scraper (XApifyService), falling back to the X API while it's down.");
                 return new XProviderFailover();

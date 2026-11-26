@@ -36,12 +36,15 @@ public class XService implements SocialMediaScanner {
     // multiple refreshMetrics jobs run concurrently and deadlock on overlapping x_posts rows.
     private final java.util.concurrent.atomic.AtomicBoolean initialized = new java.util.concurrent.atomic.AtomicBoolean(false);
     private final TrackedEntityScheduler entitySchedule = new TrackedEntityScheduler("Aura-X", 300);
-    // Set by XProviderFailover when X goes back to Apify: no polls, no refresh.
+    // Set by XProviderFailover / XApiFirstFailover while X is on Apify: no polls, no refresh.
     private volatile boolean paused;
     private static String ACCESS_TOKEN;
 //    private static final String API_URL = "https://api.twitter.com/2";
     private static final String API_URL = "https://api.x.com/2";
     private static int numberOfPosts;
+    // Set when X answers 402 (the developer account has no credits left); cleared by the next
+    // successful request. XApiFirstFailover moves X to Apify while it's set.
+    private static volatile String creditOutage;
 
     // X API hard cap for batched tweet lookups
     private static final int LOOKUP_BATCH_SIZE = 100;
@@ -341,7 +344,11 @@ public class XService implements SocialMediaScanner {
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
 
         if (response.statusCode() == 200) {
+            creditOutage = null;
             return JsonParser.parseString(response.body()).getAsJsonObject();
+        }
+        if (response.statusCode() == 402) {
+            creditOutage = "X API credits depleted (402)";
         }
         // 2. Handle Rate Limiting (X API 429)
         if (response.statusCode() == 429) {
@@ -365,6 +372,33 @@ public class XService implements SocialMediaScanner {
         }
 
         throw new RuntimeException("API Request failed. Status: " + response.statusCode() + ", Body: " + response.body());
+    }
+
+    /** Why the X API can't be used right now (no credits), or null when it can. */
+    static String creditOutage() {
+        return creditOutage;
+    }
+
+    /**
+     * Whether the X API has credits again: one recent search for {@code x.failover.probe.query}
+     * with the smallest page X allows (10 posts, about $0.05 when it succeeds; a 402 costs
+     * nothing). Returns true, and clears the outage, when X answers 200.
+     */
+    static boolean probeCredits() {
+        String query = AppProperties.getProperty("x.failover.probe.query");
+        if (query == null || query.isBlank()) query = "cinema";
+        try {
+            if (ACCESS_TOKEN == null) loadConfig();
+            String url = String.format("%s/tweets/search/recent?query=%s&max_results=10", API_URL,
+                    URLEncoder.encode(query.trim(), StandardCharsets.UTF_8));
+            JsonObject response = sendRequest(url);
+            recordSearchCost("(credit check)", response);
+            return true;
+        } catch (Exception e) {
+            if (creditOutage == null) creditOutage = e.getMessage();
+            System.err.println("[X API] Credit check failed: " + e.getMessage());
+            return false;
+        }
     }
 
     /** Stops polling and refreshing until the next scan(). */
