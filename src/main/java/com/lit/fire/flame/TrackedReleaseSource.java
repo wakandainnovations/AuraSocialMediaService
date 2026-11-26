@@ -11,7 +11,9 @@ import java.time.LocalDate;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -117,15 +119,18 @@ public class TrackedReleaseSource {
         return out;
     }
 
-    /** Existing TMDB ids among non-ended rows, so discovery keeps refreshing ones TMDB no longer returns in range. */
-    static List<Integer> tmdbIdsStillRelevant(LocalDate today) {
-        List<Integer> ids = new ArrayList<>();
-        String sql = "SELECT tmdb_id FROM tracked_releases WHERE tmdb_id IS NOT NULL AND track_until >= ?";
+    /**
+     * TMDB id -> title of non-ended rows, so discovery keeps refreshing ones TMDB no longer returns
+     * in range (and can name the ones TMDB has dropped).
+     */
+    static Map<Integer, String> tmdbIdsStillRelevant(LocalDate today) {
+        Map<Integer, String> ids = new LinkedHashMap<>();
+        String sql = "SELECT tmdb_id, title FROM tracked_releases WHERE tmdb_id IS NOT NULL AND track_until >= ?";
         try (Connection conn = DatabaseService.getConnection();
              PreparedStatement pstmt = conn.prepareStatement(sql)) {
             pstmt.setDate(1, Date.valueOf(today));
             try (ResultSet rs = pstmt.executeQuery()) {
-                while (rs.next()) ids.add(rs.getInt(1));
+                while (rs.next()) ids.put(rs.getInt(1), rs.getString(2));
             }
         } catch (SQLException e) {
             System.err.println("Database error in tmdbIdsStillRelevant: " + e.getMessage());

@@ -17,7 +17,7 @@ import java.util.Set;
 /**
  * Finds every India-origin release TMDB knows about and writes it to this week's release file
  * (see {@link ReleaseFileStore}). It no longer writes tracked_releases itself:
- * {@link ReleaseFileListener} loads the latest weekly file into the table, so movies added by
+ * scripts/release_file_listener.py loads the latest weekly file into the table, so movies added by
  * hand to the file's "manual" list are tracked exactly like TMDB's.
  *
  * Each pass discovers Indian-language releases opening in Indian theatres (no shorts, festival-only
@@ -26,7 +26,9 @@ import java.util.Set;
  * look-ahead lists movies a week or so before their tracking starts, so admins can review and
  * exclude them in aura-radix before any budget is spent. Known, not-yet-ended movies (in the table
  * or the previous file) that TMDB no longer returns for that range - typically a postponed
- * release - are re-fetched by id so their release date moves with it.
+ * release - are re-fetched by id so their release date moves with it. One that no longer has any
+ * India theatrical release on TMDB (postponed with no new date) goes in the file's "removed" list,
+ * and the listener excludes it so it isn't scanned on the stale date.
  *
  * The first pass of an ISO week (IST) creates a new file; later passes that week rewrite it. Either
  * way the "tmdb" list is regenerated and the "manual" list is kept: from this week's file as-is,
@@ -104,36 +106,22 @@ public class ReleaseDiscoveryService implements SocialMediaScanner {
                 if (!r.releaseDate().plusDays(daysAfter).isBefore(today)) previous.put(r.tmdbId(), r);
             }
         }
-        Set<Integer> known = new HashSet<>(previous.keySet());
-        known.addAll(TrackedReleaseSource.tmdbIdsStillRelevant(today));
+        // id -> last known title (for the "removed" list); the table's title wins over the file's.
+        Map<Integer, String> known = new LinkedHashMap<>();
+        previous.forEach((id, r) -> known.put(id, r.title()));
+        known.putAll(TrackedReleaseSource.tmdbIdsStillRelevant(today));
 
         Map<Integer, TmdbReleaseClient.Release> out = new LinkedHashMap<>();
         int skippedLanguage = 0;
         for (TmdbReleaseClient.Release r : discovered) {
-            if (known.contains(r.tmdbId()) || TrackedReleaseSource.isIndianLanguage(r.language(), indianLanguages)) {
+            if (known.containsKey(r.tmdbId()) || TrackedReleaseSource.isIndianLanguage(r.language(), indianLanguages)) {
                 out.put(r.tmdbId(), r);
             } else {
                 skippedLanguage++;
             }
         }
 
-        int refreshed = 0;
-        int failed = 0;
-        for (Integer id : known) {
-            if (out.containsKey(id)) continue;
-            try {
-                TmdbReleaseClient.Release r = tmdb.fetch(id, from);
-                if (r != null) {
-                    out.put(id, r);
-                    refreshed++;
-                }
-            } catch (Exception e) {
-                failed++;
-                System.err.println("[Discovery] Failed to refresh tmdb " + id + ": " + e.getMessage());
-                // Keep the last known details rather than dropping the movie from the file.
-                if (previous.containsKey(id)) out.put(id, previous.get(id));
-            }
-        }
+        Refresh refresh = refreshKnown(known, out, previous, id -> tmdb.fetch(id, from));
 
         List<TmdbReleaseClient.Release> tmdbEntries = new ArrayList<>(out.values());
         tmdbEntries.sort(Comparator.comparing(TmdbReleaseClient.Release::releaseDate)
@@ -144,16 +132,59 @@ public class ReleaseDiscoveryService implements SocialMediaScanner {
                 : base.path().equals(target) ? base.manualRaw()
                 : stillTracked(base.manualRaw(), today, daysAfter);
         try {
-            ReleaseFileStore.write(target, ReleaseFileStore.weekName(today), tmdbEntries, manual);
+            ReleaseFileStore.write(target, ReleaseFileStore.weekName(today), tmdbEntries, manual, refresh.removed());
         } catch (Exception e) {
             throw new RuntimeException("Could not write " + target + ": " + e.getMessage(), e);
         }
 
         System.out.println("[Discovery] " + discovered.size() + " India theatrical release(s) dated " + from + ".." + to
-                + " (" + skippedLanguage + " non-Indian-language skipped), " + refreshed + " out-of-range refreshed, "
-                + failed + " failed; wrote " + tmdbEntries.size() + " TMDB + " + manual.size() + " manual to " + target
+                + " (" + skippedLanguage + " non-Indian-language skipped), " + refresh.refreshed() + " out-of-range refreshed, "
+                + refresh.removed().size() + " no longer dated in India, " + refresh.failed() + " failed; wrote "
+                + tmdbEntries.size() + " TMDB + " + manual.size() + " manual + " + refresh.removed().size()
+                + " removed to " + target
                 + (base != null && !base.path().equals(target) ? " (new week; manual carried over from "
                 + base.path().getFileName() + ")" : "") + ".");
+    }
+
+    interface Fetcher {
+        /** The movie's current details, or null when TMDB has no India theatrical release for it. */
+        TmdbReleaseClient.Release fetch(int tmdbId) throws Exception;
+    }
+
+    record Refresh(int refreshed, int failed, List<ReleaseFileStore.Removed> removed) {
+    }
+
+    /**
+     * Re-fetches each known movie the discover query didn't return, adding it to {@code out}. One
+     * TMDB no longer dates in India is reported as removed; one whose fetch fails keeps its
+     * previous file entry (if any) and is not reported as removed - a TMDB outage mustn't untrack
+     * movies.
+     */
+    static Refresh refreshKnown(Map<Integer, String> known, Map<Integer, TmdbReleaseClient.Release> out,
+                                Map<Integer, TmdbReleaseClient.Release> previous, Fetcher fetcher) {
+        int refreshed = 0;
+        int failed = 0;
+        List<ReleaseFileStore.Removed> removed = new ArrayList<>();
+        for (Map.Entry<Integer, String> e : known.entrySet()) {
+            int id = e.getKey();
+            if (out.containsKey(id)) continue;
+            try {
+                TmdbReleaseClient.Release r = fetcher.fetch(id);
+                if (r != null) {
+                    out.put(id, r);
+                    refreshed++;
+                } else {
+                    removed.add(new ReleaseFileStore.Removed(id, e.getValue()));
+                }
+            } catch (Exception ex) {
+                failed++;
+                System.err.println("[Discovery] Failed to refresh tmdb " + id + ": " + ex.getMessage());
+                // Keep the last known details rather than dropping the movie from the file.
+                if (previous.containsKey(id)) out.put(id, previous.get(id));
+            }
+        }
+        removed.sort(Comparator.comparingInt(ReleaseFileStore.Removed::tmdbId));
+        return new Refresh(refreshed, failed, removed);
     }
 
     /** This week's file if it exists, else the latest older one, else null. Throws if it can't be parsed. */

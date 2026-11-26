@@ -1,6 +1,11 @@
-"""python3 -m unittest discover -s scripts  (no database needed)"""
+"""python3 -m unittest discover -s scripts  (no database needed)
+
+Set TEST_DATABASE_URL to also run SyncDatabaseTest against PostgreSQL: it works on a TEMP copy of
+tracked_releases (which shadows the real table for that connection only), so no real rows change.
+"""
 import datetime as dt
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -55,10 +60,24 @@ class FileParsingTest(unittest.TestCase):
             p = self.write(d, "releases-2026-W47.json", {"tmdb": [{"title": "No id", "release_date": "2026-11-20"}],
                                                          "manual": [{"title": "Ok", "release_date": "2026-11-20"},
                                                                     {"title": "Bad", "release_date": "20/11/2026"}]})
-            tmdb, manual, errors = rfl.read_week_file(p)
+            tmdb, manual, removed, errors = rfl.read_week_file(p)
             self.assertEqual([], tmdb)
             self.assertEqual(["Ok"], [m["title"] for m in manual])
             self.assertEqual(2, len(errors))
+
+    def test_removed_entries_are_parsed_and_bad_ones_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self.write(d, "releases-2026-W48.json", {"tmdb": [], "manual": [],
+                                                         "removed": [{"tmdb_id": 1504630, "title": "Mysaa"},
+                                                                     {"tmdb_id": "77"}, {"title": "No id"}]})
+            _, _, removed, errors = rfl.read_week_file(p)
+            self.assertEqual([{"tmdb_id": 1504630, "title": "Mysaa"}, {"tmdb_id": 77, "title": None}], removed)
+            self.assertEqual(1, len(errors))
+
+    def test_file_without_removed_list_still_loads(self):
+        with tempfile.TemporaryDirectory() as d:
+            _, _, removed, errors = rfl.read_week_file(self.write(d, "releases-2026-W47.json", {"tmdb": []}))
+            self.assertEqual(([], []), (removed, errors))
 
     def test_invalid_json_raises(self):
         with tempfile.TemporaryDirectory() as d:
@@ -70,6 +89,89 @@ class FileParsingTest(unittest.TestCase):
             for name in ("releases-2026-W52.json", "releases-2027-W01.json", "releases-2026-W47.json.tmp", "notes.json"):
                 self.write(d, name, {})
             self.assertEqual("releases-2027-W01.json", rfl.latest_file(Path(d)).name)
+
+
+class LanguageExclusionTest(unittest.TestCase):
+    def test_only_auto_tracked_languages_start_included(self):
+        s = rfl.Settings({})
+        self.assertEqual((False, None), rfl.language_exclusion("tamil", s))
+        excluded, reason = rfl.language_exclusion("hindi", s)
+        self.assertTrue(excluded)
+        self.assertIn("hindi is not auto-tracked", reason)
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), "set TEST_DATABASE_URL to run against PostgreSQL")
+class SyncDatabaseTest(unittest.TestCase):
+    TODAY = dt.datetime.now(rfl.IST).date()
+
+    def setUp(self):
+        import psycopg2
+        self.conn = psycopg2.connect(os.environ["TEST_DATABASE_URL"])
+        with self.conn.cursor() as cur:
+            cur.execute("CREATE TEMP TABLE tracked_releases (LIKE public.tracked_releases INCLUDING ALL)")
+        self.conn.commit()
+        self.dir = tempfile.TemporaryDirectory()
+        self.s = rfl.Settings({})
+
+    def tearDown(self):
+        self.conn.close()  # drops the temp table
+        self.dir.cleanup()
+
+    def entry(self, tmdb_id, title, language, release):
+        return {"tmdb_id": tmdb_id, "title": title, "original_title": title, "language": language,
+                "release_date": release.isoformat(), "popularity": 1.0, "poster_path": None,
+                "context_terms": [], "genres": [], "runtime": None, "director": None, "production_company": None}
+
+    def sync(self, tmdb=(), removed=()):
+        p = Path(self.dir.name) / "releases-2026-W48.json"
+        p.write_text(json.dumps({"tmdb": list(tmdb), "manual": [], "removed": list(removed)}), encoding="utf-8")
+        rfl.sync(self.conn, p, self.s)
+
+    def row(self, tmdb_id):
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT excluded, excluded_reason, excluded_at IS NOT NULL, release_date FROM tracked_releases "
+                        "WHERE tmdb_id = %s", (tmdb_id,))
+            return cur.fetchone()
+
+    def test_removed_movie_is_excluded_then_restored_when_dated_again(self):
+        soon = self.TODAY + dt.timedelta(days=1)
+        self.sync(tmdb=[self.entry(1, "Mysaa", "telugu", soon)])
+        self.assertEqual((False, None, False, soon), self.row(1))
+
+        self.sync(removed=[{"tmdb_id": 1, "title": "Mysaa"}])
+        self.assertEqual((True, rfl.REMOVED_REASON, True, soon), self.row(1))
+
+        later = self.TODAY + dt.timedelta(days=30)
+        self.sync(tmdb=[self.entry(1, "Mysaa", "telugu", later)])
+        self.assertEqual((False, None, False, later), self.row(1))
+
+    def test_redated_non_auto_tracked_movie_gets_language_exclusion_back(self):
+        soon = self.TODAY + dt.timedelta(days=1)
+        self.sync(tmdb=[self.entry(2, "Diler", "hindi", soon)])
+        with self.conn.cursor() as cur:  # as if it had been excluded for losing its India date
+            cur.execute("UPDATE tracked_releases SET excluded_reason = %s WHERE tmdb_id = 2", (rfl.REMOVED_REASON,))
+        self.conn.commit()
+        self.sync(tmdb=[self.entry(2, "Diler", "hindi", soon)])
+        excluded, reason, _, _ = self.row(2)
+        self.assertTrue(excluded)
+        self.assertIn("hindi is not auto-tracked", reason)
+
+    def test_removed_leaves_admin_choices_and_ended_rows_alone(self):
+        soon = self.TODAY + dt.timedelta(days=1)
+        past = self.TODAY - dt.timedelta(days=10)
+        self.sync(tmdb=[self.entry(3, "Restored", "tamil", soon), self.entry(4, "Pulse", "tamil", soon),
+                        self.entry(5, "Ended", "tamil", past)])
+        with self.conn.cursor() as cur:
+            cur.execute("UPDATE tracked_releases SET relevance_override = TRUE WHERE tmdb_id = 3")
+            cur.execute("UPDATE tracked_releases SET excluded = TRUE, excluded_reason = 'not worth it' WHERE tmdb_id = 4")
+        self.conn.commit()
+        self.sync(removed=[{"tmdb_id": i, "title": None} for i in (3, 4, 5, 999)])
+        self.assertEqual((False, None), self.row(3)[:2])
+        self.assertEqual((True, "not worth it"), self.row(4)[:2])
+        self.assertEqual((False, None), self.row(5)[:2])
+        # A movie the admin excluded for their own reason stays excluded when TMDB dates it again.
+        self.sync(tmdb=[self.entry(4, "Pulse", "tamil", soon)])
+        self.assertEqual((True, "not worth it"), self.row(4)[:2])
 
 
 class ConfigTest(unittest.TestCase):

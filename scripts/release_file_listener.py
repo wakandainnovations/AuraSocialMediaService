@@ -7,7 +7,8 @@ writes one file per ISO week (IST), <dir>/releases-2026-W47.json:
     {
       "week": "2026-W47",
       "tmdb":   [ ...from TMDB, rewritten on every discovery pass - don't edit... ],
-      "manual": [ ...yours: movies TMDB doesn't list, kept by discovery and carried into new weeks... ]
+      "manual": [ ...yours: movies TMDB doesn't list, kept by discovery and carried into new weeks... ],
+      "removed": [ ...from TMDB: tracked movies TMDB no longer dates in India (postponed, no new date)... ]
     }
 
 This script watches the directory and, whenever the newest file changes (discovery rewrote it, a new
@@ -21,6 +22,10 @@ week started, or you edited it), upserts its entries into tracked_releases:
   context_terms, track_from, track_until, poster_path, genres, runtime, director, production_company.
   Editing an entry updates its row (fields left out keep their current value); removing it from
   the file does not delete the row - exclude the movie in aura-radix instead.
+* "removed" entries: keyed by tmdb_id. A row whose tracking window hasn't ended is excluded
+  ("Auto-excluded: no India theatrical release on TMDB anymore ...") so it isn't scanned on its stale
+  date - unless an admin has restored it (relevance_override). If TMDB dates the movie again it comes
+  back in "tmdb", and that exclusion is lifted (or swapped for the language one, if not auto-tracked).
 
 Usage:
     pip install -r scripts/requirements.txt
@@ -50,6 +55,9 @@ FILE_NAME = re.compile(r"releases-(\d{4})-W(\d{2})\.json$")
 DEFAULT_INDIAN_LANGUAGES = ("hindi,tamil,telugu,kannada,malayalam,marathi,bengali,punjabi,gujarati,odia,"
                             "assamese,bhojpuri,urdu,sanskrit,konkani,tulu,maithili,rajasthani")
 DEFAULT_AUTO_TRACK_LANGUAGES = "tamil,telugu,kannada,malayalam"
+# Exact text matters: a row excluded with this reason is restored when TMDB dates the movie again.
+REMOVED_REASON = "Auto-excluded: no India theatrical release on TMDB anymore (postponed?) - restore to track"
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 
 def log(msg: str) -> None:
@@ -201,14 +209,23 @@ def parse_manual(o: dict) -> dict:
                 context_terms=_context_terms(o), **_details(o))
 
 
-def read_week_file(path: Path) -> Tuple[List[dict], List[dict], List[str]]:
-    """(tmdb entries, manual entries, errors). Raises ValueError if the file isn't valid JSON."""
+def parse_removed(o: dict) -> dict:
+    if o.get("tmdb_id") is None:
+        raise EntryError("missing tmdb_id")
+    try:
+        return dict(tmdb_id=int(o["tmdb_id"]), title=_str(o, "title"))
+    except (TypeError, ValueError):
+        raise EntryError("tmdb_id is not a number")
+
+
+def read_week_file(path: Path) -> Tuple[List[dict], List[dict], List[dict], List[str]]:
+    """(tmdb entries, manual entries, removed entries, errors). Raises ValueError if the file isn't valid JSON."""
     root = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(root, dict):
         raise ValueError("top level is not a JSON object")
     errors: List[str] = []
-    parsed: Dict[str, List[dict]] = {"tmdb": [], "manual": []}
-    for key, parser in (("tmdb", parse_tmdb), ("manual", parse_manual)):
+    parsed: Dict[str, List[dict]] = {"tmdb": [], "manual": [], "removed": []}
+    for key, parser in (("tmdb", parse_tmdb), ("manual", parse_manual), ("removed", parse_removed)):
         items = root.get(key) or []
         if not isinstance(items, list):
             errors.append(f'"{key}" is not a list')
@@ -221,7 +238,7 @@ def read_week_file(path: Path) -> Tuple[List[dict], List[dict], List[str]]:
                 parsed[key].append(parser(o))
             except EntryError as e:
                 errors.append(f"{key}[{i}] {o.get('title')!r}: {e}")
-    return parsed["tmdb"], parsed["manual"], errors
+    return parsed["tmdb"], parsed["manual"], parsed["removed"], errors
 
 
 def latest_file(directory: Path) -> Optional[Path]:
@@ -290,24 +307,36 @@ def window(r: dict, s: Settings) -> Tuple[dt.date, dt.date]:
             r.get("track_until") or r["release_date"] + dt.timedelta(days=s.days_after))
 
 
+def language_exclusion(language: Optional[str], s: Settings) -> Tuple[bool, Optional[str]]:
+    """(excluded, reason) for a TMDB release by language: only auto-tracked languages are scanned."""
+    if (language or "").strip().lower() in s.auto_track:
+        return False, None
+    return True, f"Auto-excluded: {language or 'unknown'} is not auto-tracked (restore to track)"
+
+
 def upsert_tmdb(cur, r: dict, s: Settings) -> bool:
     """Refresh an existing row's TMDB-owned fields, or insert a new Indian-language release.
-    Returns True when a row was inserted."""
+    Returns True when a row was inserted. A row excluded only because TMDB had dropped its India
+    date (REMOVED_REASON) is dated again, so it gets the exclusion a new row would get instead."""
     start, end = window(r, s)
+    auto_exclude, reason = language_exclusion(r["language"], s)
     cur.execute(
         "UPDATE tracked_releases SET title = %s, original_title = %s, language = %s, release_date = %s, "
         "track_from = %s, track_until = %s, popularity = %s, poster_path = %s, context_terms = %s, "
-        "genres = %s, runtime = %s, director = %s, production_company = %s, updated_at = NOW() "
-        "WHERE tmdb_id = %s",
+        "genres = %s, runtime = %s, director = %s, production_company = %s, "
+        "excluded = CASE WHEN excluded_reason = %s THEN %s ELSE excluded END, "
+        "excluded_at = CASE WHEN excluded_reason = %s AND NOT %s THEN NULL ELSE excluded_at END, "
+        "excluded_reason = CASE WHEN excluded_reason = %s THEN %s ELSE excluded_reason END, "
+        "updated_at = NOW() WHERE tmdb_id = %s",
         (r["title"], r["original_title"], r["language"], r["release_date"], start, end, r["popularity"],
          r["poster_path"], r["context_terms"], r["genres"], r["runtime"], r["director"],
-         r["production_company"], r["tmdb_id"]))
+         r["production_company"], REMOVED_REASON, auto_exclude, REMOVED_REASON, auto_exclude,
+         REMOVED_REASON, reason, r["tmdb_id"]))
     if cur.rowcount > 0:
         return False
     language = (r["language"] or "").strip().lower()
     if language not in s.indian:
         return False
-    auto_exclude = language not in s.auto_track
     cur.execute(
         "INSERT INTO tracked_releases (tmdb_id, entity_name, title, original_title, language, release_date, "
         "track_from, track_until, keywords, category, source, popularity, poster_path, excluded, "
@@ -316,9 +345,19 @@ def upsert_tmdb(cur, r: dict, s: Settings) -> bool:
         "CASE WHEN %s THEN NOW() END, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
         (r["tmdb_id"], unique_entity_name(cur, r), r["title"], r["original_title"], r["language"],
          r["release_date"], start, end, default_keywords(r["title"], r["original_title"]), r["popularity"],
-         r["poster_path"], auto_exclude,
-         f"Auto-excluded: {r['language'] or 'unknown'} is not auto-tracked (restore to track)" if auto_exclude else None,
-         auto_exclude, r["context_terms"], r["genres"], r["runtime"], r["director"], r["production_company"]))
+         r["poster_path"], auto_exclude, reason, auto_exclude, r["context_terms"], r["genres"], r["runtime"], r["director"], r["production_company"]))
+    return cur.rowcount > 0
+
+
+def exclude_removed(cur, r: dict, today: dt.date) -> bool:
+    """Exclude a TMDB row whose India release TMDB dropped. Rows already excluded, already ended or
+    restored by an admin are left alone. Returns True when a row was excluded."""
+    cur.execute(
+        "UPDATE tracked_releases SET excluded = TRUE, excluded_reason = %s, excluded_at = NOW(), updated_at = NOW() "
+        "WHERE tmdb_id = %s AND NOT excluded AND NOT relevance_override AND track_until >= %s",
+        (REMOVED_REASON, r["tmdb_id"], today))
+    if cur.rowcount > 0:
+        log(f"Excluded {r['title'] or r['tmdb_id']!r} (tmdb {r['tmdb_id']}): no India theatrical release on TMDB anymore.")
     return cur.rowcount > 0
 
 
@@ -355,21 +394,24 @@ def upsert_manual(cur, m: dict, s: Settings) -> str:
 
 def sync(conn, path: Path, s: Settings) -> None:
     try:
-        tmdb, manual, errors = read_week_file(path)
+        tmdb, manual, removed, errors = read_week_file(path)
     except (ValueError, OSError) as e:
         log(f"{path} doesn't parse, nothing loaded (fix and save it again): {e}")
         return
     for err in errors:
         log(f"Skipped {err}")
 
-    counts = {"tmdb_new": 0, "inserted": 0, "updated": 0, "skipped": 0, "failed": 0}
+    counts = {"tmdb_new": 0, "inserted": 0, "updated": 0, "skipped": 0, "failed": 0, "removed": 0}
+    today = dt.datetime.now(IST).date()
     # One transaction per entry, so one bad row doesn't undo the rest.
-    for kind, entries in (("tmdb", tmdb), ("manual", manual)):
+    for kind, entries in (("tmdb", tmdb), ("manual", manual), ("removed", removed)):
         for e in entries:
             try:
                 with conn.cursor() as cur:
                     if kind == "tmdb":
                         counts["tmdb_new"] += upsert_tmdb(cur, e, s)
+                    elif kind == "removed":
+                        counts["removed"] += exclude_removed(cur, e, today)
                     else:
                         counts[upsert_manual(cur, e, s)] += 1
                 conn.commit()
@@ -378,7 +420,8 @@ def sync(conn, path: Path, s: Settings) -> None:
                 counts["failed"] += 1
                 log(f"Failed to save {kind} {e.get('title')!r}: {ex}")
     log(f"Loaded {path.name}: {len(tmdb)} TMDB ({counts['tmdb_new']} new), {len(manual)} manual "
-        f"({counts['inserted']} new, {counts['updated']} updated), "
+        f"({counts['inserted']} new, {counts['updated']} updated), {len(removed)} removed "
+        f"({counts['removed']} newly excluded), "
         f"{counts['skipped'] + counts['failed'] + len(errors)} skipped/failed.")
 
 

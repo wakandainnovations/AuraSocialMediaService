@@ -25,7 +25,7 @@ import java.util.stream.Stream;
 
 /**
  * The weekly release files between {@link ReleaseDiscoveryService} (writer) and
- * {@link ReleaseFileListener} (reader, which loads the latest file into tracked_releases).
+ * scripts/release_file_listener.py (reader, which loads the latest file into tracked_releases).
  *
  * One file per ISO week (IST), {@code <release.files.dir>/releases-2026-W47.json}:
  * <pre>
@@ -33,9 +33,13 @@ import java.util.stream.Stream;
  *   "week": "2026-W47",
  *   "generated_at": "2026-11-20T09:00:00+05:30",
  *   "tmdb":   [ ...written by discovery, rewritten on every pass - don't edit... ],
- *   "manual": [ ...yours: movies TMDB doesn't list, kept as-is by discovery... ]
+ *   "manual": [ ...yours: movies TMDB doesn't list, kept as-is by discovery... ],
+ *   "removed": [ ...written by discovery: tracked TMDB movies TMDB no longer dates in India... ]
  * }
  * </pre>
+ * A {@code removed} entry ({@code tmdb_id}, {@code title}) is a known, not-yet-ended movie whose
+ * re-fetch found no India theatrical release - typically postponed with no new date. The listener
+ * excludes its row so it isn't scanned on the stale date.
  * A manual entry needs only {@code title} and {@code release_date}; see {@link ManualRelease}
  * for the optional fields. When discovery starts a new week's file it carries over the previous
  * file's manual entries whose tracking window hasn't ended, so they never need re-adding.
@@ -57,13 +61,17 @@ public class ReleaseFileStore {
                                 TmdbReleaseClient.Details details) {
     }
 
+    /** A tracked TMDB movie that no longer has an India theatrical release on TMDB. */
+    public record Removed(int tmdbId, String title) {
+    }
+
     /**
      * Parsed contents of one weekly file. {@code manualRaw} holds every manual entry as written,
      * including ones that failed to parse (reported in {@code errors}), so rewriting the file
      * never drops a hand-written entry that just has a typo.
      */
     public record WeekFile(Path path, List<TmdbReleaseClient.Release> tmdb, List<ManualRelease> manual,
-                           List<JsonObject> manualRaw, List<String> errors) {
+                           List<JsonObject> manualRaw, List<Removed> removed, List<String> errors) {
     }
 
     private ReleaseFileStore() {
@@ -115,7 +123,13 @@ public class ReleaseFileStore {
                 errors.add("manual entry " + o.get("title") + ": " + e.getMessage());
             }
         }
-        return new WeekFile(path, tmdb, manual, manualRaw, errors);
+        List<Removed> removed = new ArrayList<>();
+        for (JsonObject o : objects(root, "removed")) {
+            if (o.has("tmdb_id") && !o.get("tmdb_id").isJsonNull()) {
+                removed.add(new Removed(o.get("tmdb_id").getAsInt(), str(o, "title")));
+            }
+        }
+        return new WeekFile(path, tmdb, manual, manualRaw, removed, errors);
     }
 
     private static List<JsonObject> objects(JsonObject root, String key) {
@@ -182,21 +196,30 @@ public class ReleaseFileStore {
      * Writes the file via a temp file + rename, so the listener never reads a half-written file.
      * Manual entries are written back as the original JSON objects, unchanged.
      */
-    static void write(Path path, String week, List<TmdbReleaseClient.Release> tmdb, List<JsonObject> manual)
-            throws IOException {
+    static void write(Path path, String week, List<TmdbReleaseClient.Release> tmdb, List<JsonObject> manual,
+                      List<Removed> removed) throws IOException {
         JsonObject root = new JsonObject();
         root.addProperty("week", week);
         root.addProperty("generated_at", OffsetDateTime.now(TrackedReleaseSource.IST).withNano(0).toString());
         root.addProperty("note", "\"tmdb\" is rewritten by release discovery on every pass - edit \"manual\" instead. "
                 + "A manual entry needs title and release_date (YYYY-MM-DD); optional: entity_name, original_title, "
                 + "language, keywords, context_terms, track_from, track_until, poster_path, genres, runtime, director, "
-                + "production_company.");
+                + "production_company. \"removed\" lists tracked TMDB movies TMDB no longer dates in India; "
+                + "the listener excludes them.");
         JsonArray t = new JsonArray();
         tmdb.forEach(r -> t.add(tmdbToJson(r)));
         root.add("tmdb", t);
         JsonArray m = new JsonArray();
         manual.forEach(m::add);
         root.add("manual", m);
+        JsonArray rm = new JsonArray();
+        for (Removed r : removed) {
+            JsonObject o = new JsonObject();
+            o.addProperty("tmdb_id", r.tmdbId());
+            o.addProperty("title", r.title());
+            rm.add(o);
+        }
+        root.add("removed", rm);
 
         Files.createDirectories(path.getParent() == null ? Paths.get(".") : path.getParent());
         Path tmp = path.resolveSibling(path.getFileName() + ".tmp");

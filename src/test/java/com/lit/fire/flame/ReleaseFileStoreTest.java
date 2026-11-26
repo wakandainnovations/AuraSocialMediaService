@@ -7,7 +7,9 @@ import junit.framework.TestCase;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDate;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 public class ReleaseFileStoreTest extends TestCase {
 
@@ -26,16 +28,56 @@ public class ReleaseFileStoreTest extends TestCase {
         JsonObject manual = JsonParser.parseString(
                 "{\"title\":\"Coolie\",\"release_date\":\"2026-12-05\",\"my_note\":\"kept\"}").getAsJsonObject();
         JsonObject broken = JsonParser.parseString("{\"title\":\"Typo\",\"release_date\":\"soon\"}").getAsJsonObject();
-        ReleaseFileStore.write(file, "2026-W47", List.of(r), List.of(manual, broken));
+        List<ReleaseFileStore.Removed> removed = List.of(new ReleaseFileStore.Removed(7, "Mysaa"));
+        ReleaseFileStore.write(file, "2026-W47", List.of(r), List.of(manual, broken), removed);
 
         ReleaseFileStore.WeekFile read = ReleaseFileStore.read(file);
         assertEquals(List.of(r), read.tmdb());
         assertEquals(1, read.manual().size());
         assertEquals("Coolie", read.manual().get(0).entityName());
         assertEquals(List.of(manual, broken), read.manualRaw());
+        assertEquals(removed, read.removed());
         assertEquals(1, read.errors().size());
         assertFalse(Files.exists(file.resolveSibling(file.getFileName() + ".tmp")));
         assertEquals(file, ReleaseFileStore.latest(dir));
+    }
+
+    public void testFileWithoutRemovedListReadsAsEmpty() throws Exception {
+        Path file = Files.createTempDirectory("releases").resolve("releases-2026-W47.json");
+        Files.writeString(file, "{\"tmdb\":[],\"manual\":[]}");
+        assertEquals(List.of(), ReleaseFileStore.read(file).removed());
+    }
+
+    private static TmdbReleaseClient.Release release(int id, String title, LocalDate date) {
+        return new TmdbReleaseClient.Release(id, title, title, "telugu", date, null, null, List.of(), null);
+    }
+
+    public void testRefreshReportsUndatedMoviesAsRemovedButNotFailures() {
+        LocalDate day = LocalDate.of(2026, 11, 27);
+        TmdbReleaseClient.Release postponedOld = release(2, "Postponed", day);
+        TmdbReleaseClient.Release flakyOld = release(4, "Flaky", day);
+        TmdbReleaseClient.Release moved = release(1, "Moved", day.plusDays(7));
+        Map<Integer, String> known = new LinkedHashMap<>();
+        known.put(1, "Moved");
+        known.put(2, "Postponed");
+        known.put(3, "Discovered");
+        known.put(4, "Flaky");
+        Map<Integer, TmdbReleaseClient.Release> out = new LinkedHashMap<>();
+        out.put(3, release(3, "Discovered", day));
+
+        ReleaseDiscoveryService.Refresh refresh = ReleaseDiscoveryService.refreshKnown(known, out,
+                Map.of(2, postponedOld, 4, flakyOld), id -> {
+                    if (id == 1) return moved;
+                    if (id == 2) return null;  // TMDB has no India theatrical date for it anymore
+                    if (id == 4) throw new Exception("TMDB HTTP 503");
+                    throw new AssertionError("discovered movie re-fetched: " + id);
+                });
+
+        assertEquals(1, refresh.refreshed());
+        assertEquals(1, refresh.failed());
+        assertEquals(List.of(new ReleaseFileStore.Removed(2, "Postponed")), refresh.removed());
+        // The un-dated movie leaves the tmdb list; a failed fetch keeps the last known entry.
+        assertEquals(Map.of(1, moved, 3, release(3, "Discovered", day), 4, flakyOld), out);
     }
 
     public void testLatestPicksNewestWeek() throws Exception {
